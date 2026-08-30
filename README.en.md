@@ -56,8 +56,8 @@ The macOS build is not yet notarized with an Apple Developer ID. On first launch
 
 ## Usage Flow
 
-1. First, log in to ZCode with an account as usual. You can also use [Zcode-register](https://github.com/sui-bian-ovo/Zcode-register) to automatically register and log in to the ZCode client.
-2. Open ZCode Switcher, click the “Refresh” button, and then click “Save Current Account” to save your current login status to the local account database.
+1. Log in to one account in ZCode as usual.
+2. Open ZCode Switcher and click "Save current account" to save the current login state to the local account vault.
 3. To add more accounts, switch accounts in ZCode first, use OAuth login in the tool, or import a JSON / ZIP backup file.
 4. Saved accounts will show nickname, subscription expiration date, quota progress bars, and refresh status in the list.
 5. After enabling seamless switching, click the switch button on an account card to switch accounts. The switch does not require restarting ZCode, and the account config takes effect immediately.

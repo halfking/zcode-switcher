@@ -1,4 +1,19 @@
 {
   "enabled": true,
-  "notices": []
+  "notices": [
+    {
+      "id": "release-1.1.11-2026-08-30",
+      "kind": "system",
+      "title": {
+        "zh": "1.1.11 更新说明"
+      },
+      "body": {
+        "zh": "修复 OAuth 登录流程，优化账号排序逻辑并适配新模型额度。"
+      },
+      "level": "info",
+      "date": "2026-08-30",
+      "showOnce": true,
+      "showOnStartup": true
+    }
+  ]
 }

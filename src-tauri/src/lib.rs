@@ -18,6 +18,8 @@ use reqwest::StatusCode;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tauri::Manager;
+use tauri_plugin_deep_link::DeepLinkExt;
 
 #[derive(Serialize)]
 struct EnableRemoteDebugResult {
@@ -332,12 +334,38 @@ fn default_download_filename() -> String {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Register single-instance before deep-link so callback URLs reuse the
+        // existing window instead of opening a second process.
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            for arg in args {
+                oauth::handle_deep_link_url(&arg);
+            }
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
             captcha::init(app.handle().clone());
+            let handle = app.handle().clone();
+            handle.deep_link().on_open_url(move |event| {
+                for url in event.urls() {
+                    oauth::handle_deep_link_url(url.as_str());
+                }
+            });
+            if let Err(error) = handle.deep_link().register_all() {
+                eprintln!("无法注册 OAuth deep link: {error}");
+            }
+            if let Ok(Some(urls)) = handle.deep_link().get_current() {
+                for url in urls {
+                    oauth::handle_deep_link_url(url.as_str());
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -379,6 +407,7 @@ pub fn run() {
             download_url_to_directory,
             oauth::oauth_init,
             oauth::oauth_acquire_and_import,
+            oauth::oauth_cancel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

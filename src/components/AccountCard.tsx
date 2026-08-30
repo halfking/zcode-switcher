@@ -46,30 +46,42 @@ function daysLeft(endsAt: number): number {
   return Math.ceil(ms / 86400000);
 }
 
-/** quota 错误 → {文本, 颜色类}：超时/未登录黄，其它红 */
+/** quota 错误 → {文本, 颜色类}：超时/未登录/缓存额度黄，其它红 */
 function describeQuotaError(
   error: string,
   t: ReturnType<typeof getTexts>,
-  hasEverHadQuota: boolean
-): { text: string; className: string } {
+  hasDisplayableQuota: boolean,
+  isActiveProfile: boolean
+): { text: string; className: string; title: string } {
   const lower = error.toLowerCase();
   const isTimeout = error.includes("请求超时") || lower.includes("timeout");
   const isRateLimited =
     error.includes("429") ||
     error.includes("限流") ||
     lower.includes("too many requests");
+  const reason =
+    error.includes("billing/balance") ||
+    error.includes("app_version") ||
+    error.includes("额度明细获取失败") ||
+    error.includes("套餐额度刷新失败")
+      ? t.quotaPlanRefreshFailed
+      : error;
   if (isTimeout) {
-    return { text: t.quotaRefreshTimeoutLabel, className: "text-warn" };
+    return { text: t.quotaRefreshTimeoutLabel, className: "text-warn", title: reason };
   }
   if (isRateLimited) {
-    return { text: t.quotaRateLimited, className: "text-warn" };
+    return { text: t.quotaRateLimited, className: "text-warn", title: reason };
   }
-  if (!hasEverHadQuota) {
-    return { text: t.quotaNeedLogin, className: "text-warn" };
+  if (hasDisplayableQuota) {
+    return { text: t.quotaRefreshUsingCachedLabel, className: "text-warn", title: reason };
+  }
+  if (!isActiveProfile) {
+    return { text: t.quotaNeedLogin, className: "text-warn", title: reason };
   }
   return {
-    text: formatText(t.quotaRefreshFailedLabel, { reason: error }),
+    text: formatText(t.quotaRefreshFailedLabel, { reason }),
     className: "text-danger",
+    title: reason,
   };
 }
 
@@ -150,7 +162,7 @@ function AccountCard({
 
   // 未切到该账号前，首次额度失败才提示切换重试；当前账号失败要显示真实错误。
   const quotaErr = quota?.error
-    ? describeQuotaError(quota.error, t, showQuota || profile.active)
+    ? describeQuotaError(quota.error, t, showQuota, profile.active)
     : null;
   const showQuotaLoading = quotaLoading && !showQuota;
 
@@ -245,7 +257,7 @@ function AccountCard({
               ? "font-medium text-ok"
               : "invisible text-text-muted"
           }`}
-          title={quota?.error || ""}
+          title={quotaErr?.title || ""}
         >
           {showQuotaLoading
             ? t.quotaLoadingLabel
@@ -505,7 +517,7 @@ function AccountCard({
           ) : quotaErr ? (
             <div
               className={`text-[11px] font-medium ${quotaErr.className}`}
-              title={quota?.error || ""}
+              title={quotaErr?.title || ""}
             >
               {quotaErr.text}
             </div>
@@ -520,7 +532,7 @@ function AccountCard({
       ) : quotaErr ? (
         <div
           className={`border-t border-base-border/70 pt-2 text-[11px] font-medium ${quotaErr.className}`}
-          title={quota?.error || ""}
+          title={quotaErr?.title || ""}
         >
           {quotaErr.text}
         </div>

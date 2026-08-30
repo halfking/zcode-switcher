@@ -159,6 +159,7 @@ export default function App() {
   const activeProfile = profiles.find((p) => p.active);
   const batchQuotaRefreshDueAt = useRef(0);
   const activeQuotaRefreshDueAt = useRef(0);
+  const oauthBusyRef = useRef(false);
   const sortedProfiles = useMemo(
     () => sortProfiles(profiles, quotas, accountSortMode),
     [profiles, quotas, accountSortMode]
@@ -488,26 +489,26 @@ export default function App() {
   };
 
   /**
-   * OAuth 添加账号: 后端先启动本机临时回调端口，再打开 Z.ai 授权页。
-   * 浏览器授权完成后，后端拿 code 交换 token 并导入成本地 profile。
+   * OAuth 添加账号: 后端先登记 zcode://oauth/callback 回调，再打开 Z.ai 授权页。
+   * 浏览器授权完成后，系统协议唤回当前应用，后端拿 code 交换 token 并导入成本地 profile。
    */
   const handleOAuthAdd = async () => {
-    // 1) 立刻给反馈,免得用户以为按钮没响应(init 网络往返 + 浏览器冷启动加起来要 1-3 秒)
-    toast(t.oauthPreparing, "info");
-    let init;
     try {
-      init = await api.oauthInit();
-    } catch (e) {
-      toast(formatText(t.oauthFailed, { error: String(e) }), "error");
-      return;
-    }
-    // 2) openUrl 不 await:Windows 启动 Edge/Chrome 可能要 1-2 秒,
-    //    没必要让前端等它返回。失败了 toast 失败,但成功路径立刻进 acquire。
-    openUrl(init.authorize_url).catch((e) => {
-      toast(formatText(t.oauthFailed, { error: String(e) }), "error");
-    });
-    toast(t.oauthOpening, "info");
-    try {
+      if (oauthBusyRef.current) return;
+      oauthBusyRef.current = true;
+
+      // 先登记回调流程，再确认系统浏览器确实接受了授权地址。
+      toast(t.oauthPreparing, "info");
+      const init = await api.oauthInit();
+      try {
+        await openUrl(init.authorize_url);
+      } catch (e) {
+        await api.oauthCancel().catch(() => {});
+        toast(formatText(t.oauthFailed, { error: `无法打开浏览器：${String(e)}` }), "error");
+        return;
+      }
+
+      toast(t.oauthOpening, "info");
       const profile = await api.oauthAcquireAndImport(init.flow_id, init.poll_token);
       toast(formatText(t.oauthAdded, { name: profile.name }), "success");
       // 只重载列表 + 只刷新刚登录的新号，不全量刷
@@ -515,6 +516,8 @@ export default function App() {
       refreshQuota(profile.id);
     } catch (e) {
       toast(formatText(t.oauthFailed, { error: String(e) }), "error");
+    } finally {
+      oauthBusyRef.current = false;
     }
   };
 

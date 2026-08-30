@@ -3,34 +3,27 @@
 //! 旧的 /oauth/cli/init + /oauth/cli/poll 接口已经不可用。新版 ZCode 客户端
 //! 使用 Z.ai 授权码流程：
 //!   1. 打开 chat.z.ai/api/oauth/authorize
-//!   2. 浏览器回调本机 127.0.0.1 临时端口，拿到 code + state
+//!   2. 浏览器通过 zcode://oauth/callback 回调本机应用，拿到 code + state
 //!   3. POST zcode.z.ai/api/v1/oauth/token 交换 ZCode JWT 与 Z.ai access token
 //!   4. POST api.z.ai/api/auth/z/login 把 Z.ai token 换成 ZCode 业务 access token
 //!   5. 组装 portable JSON，复用 profile::import_profile_json 导入账号
 
-use axum::{
-    extract::{Query, State},
-    response::Html,
-    routing::get,
-    Router,
-};
 use rand::RngCore;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    net::SocketAddr,
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
-use tokio::{net::TcpListener, sync::oneshot};
+use tokio::sync::oneshot;
 
 const AUTHORIZE_URL: &str = "https://chat.z.ai/api/oauth/authorize";
 const TOKEN_URL: &str = "https://zcode.z.ai/api/v1/oauth/token";
 const USERINFO_URL: &str = "https://chat.z.ai/api/oauth/userinfo";
 const BUSINESS_LOGIN_URL: &str = "https://api.z.ai/api/auth/z/login";
 const CLIENT_ID: &str = "client_P8X5CMWmlaRO9gyO-KSqtg";
-const CALLBACK_PATH: &str = "/oauth/callback";
+const CALLBACK_URI: &str = "zcode://oauth/callback";
 const DEFAULT_DEADLINE_SECONDS: u64 = 600;
 const HTTP_TIMEOUT_SECONDS: u64 = 20;
 
@@ -43,13 +36,12 @@ pub struct OAuthInit {
 
 struct PendingFlow {
     state: String,
-    redirect_uri: String,
     receiver: oneshot::Receiver<Result<CallbackData, String>>,
-    shutdown: Option<oneshot::Sender<()>>,
+    callback_sender: Arc<Mutex<Option<oneshot::Sender<Result<CallbackData, String>>>>>,
 }
 
-#[derive(Clone)]
-struct CallbackServerState {
+struct PendingCallback {
+    state: String,
     sender: Arc<Mutex<Option<oneshot::Sender<Result<CallbackData, String>>>>>,
 }
 
@@ -57,20 +49,6 @@ struct CallbackServerState {
 struct CallbackData {
     code: String,
     state: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct CallbackQuery {
-    #[serde(default)]
-    code: Option<String>,
-    #[serde(default, rename = "authCode")]
-    auth_code: Option<String>,
-    #[serde(default)]
-    state: Option<String>,
-    #[serde(default)]
-    error: Option<String>,
-    #[serde(default)]
-    error_description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,6 +124,11 @@ fn pending_flow() -> &'static Mutex<Option<PendingFlow>> {
     PENDING.get_or_init(|| Mutex::new(None))
 }
 
+fn pending_callback() -> &'static Mutex<Option<PendingCallback>> {
+    static PENDING: OnceLock<Mutex<Option<PendingCallback>>> = OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(None))
+}
+
 fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     rand::thread_rng().fill_bytes(&mut buf);
@@ -182,173 +165,185 @@ fn body_preview(body: &str) -> String {
     body.chars().take(300).collect::<String>()
 }
 
-fn callback_html(title: &str, message: &str) -> Html<String> {
-    Html(format!(
-        r#"<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{title}</title>
-  <style>
-    body {{ margin: 0; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f7f8fb; color: #17202a; }}
-    main {{ min-height: 100vh; display: grid; place-items: center; padding: 24px; box-sizing: border-box; }}
-    section {{ max-width: 520px; padding: 28px; background: white; border: 1px solid #e7e9ef; border-radius: 16px; box-shadow: 0 18px 45px rgba(20, 26, 40, .08); }}
-    h1 {{ margin: 0 0 12px; font-size: 22px; }}
-    p {{ margin: 0; line-height: 1.7; color: #53606f; }}
-  </style>
-</head>
-<body>
-  <main>
-    <section>
-      <h1>{title}</h1>
-      <p>{message}</p>
-    </section>
-  </main>
-</body>
-</html>"#
-    ))
-}
-
-async fn oauth_callback(
-    State(server_state): State<CallbackServerState>,
-    Query(query): Query<CallbackQuery>,
-) -> Html<String> {
-    let error = query.error.as_deref().unwrap_or_default().trim();
-    let description = query
-        .error_description
-        .as_deref()
-        .unwrap_or_default()
-        .trim();
-
-    let (result, title, message) = if !error.is_empty() {
-        let detail = if description.is_empty() {
-            error.to_string()
-        } else {
-            format!("{}: {}", error, description)
-        };
-        (
-            Err(format!("OAuth 登录被拒绝:{}", detail)),
-            "登录失败",
-            "Z.ai 返回了登录失败信息，可以关闭此页面回到 ZCode Switcher 重试。",
-        )
-    } else {
-        let code = query
-            .code
-            .or(query.auth_code)
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        let state = query.state.unwrap_or_default().trim().to_string();
-        if code.is_empty() || state.is_empty() {
-            (
-                Err("OAuth 回调缺少 code 或 state".to_string()),
-                "登录失败",
-                "OAuth 回调参数不完整，可以关闭此页面回到 ZCode Switcher 重试。",
-            )
-        } else {
-            (
-                Ok(CallbackData { code, state }),
-                "登录完成",
-                "授权信息已收到，可以关闭此页面回到 ZCode Switcher。",
-            )
-        }
-    };
-
-    let sent = server_state
-        .sender
-        .lock()
-        .ok()
-        .and_then(|mut sender| sender.take())
-        .map(|sender| sender.send(result).is_ok())
-        .unwrap_or(false);
-
-    if sent {
-        callback_html(title, message)
-    } else {
-        callback_html(
-            "流程已结束",
-            "这次 OAuth 登录流程已经结束或超时，可以关闭此页面回到 ZCode Switcher。",
-        )
-    }
-}
-
-fn build_authorize_url(state: &str, redirect_uri: &str) -> Result<String, String> {
+fn build_authorize_url(state: &str) -> Result<String, String> {
     let mut url =
         reqwest::Url::parse(AUTHORIZE_URL).map_err(|e| format!("授权地址解析失败:{}", e))?;
     url.query_pairs_mut()
-        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("redirect_uri", CALLBACK_URI)
         .append_pair("response_type", "code")
         .append_pair("client_id", CLIENT_ID)
         .append_pair("state", state);
     Ok(url.to_string())
 }
 
-async fn start_callback_server(
-    state: String,
-) -> Result<
-    (
-        String,
-        oneshot::Receiver<Result<CallbackData, String>>,
-        oneshot::Sender<()>,
-    ),
-    String,
-> {
+fn callback_channel() -> (
+    Arc<Mutex<Option<oneshot::Sender<Result<CallbackData, String>>>>>,
+    oneshot::Receiver<Result<CallbackData, String>>,
+) {
     let (sender, receiver) = oneshot::channel();
-    let (shutdown, shutdown_rx) = oneshot::channel();
-    let server_state = CallbackServerState {
-        sender: Arc::new(Mutex::new(Some(sender))),
+    (Arc::new(Mutex::new(Some(sender))), receiver)
+}
+
+fn callback_data_from_url(raw_url: &str) -> Option<Result<CallbackData, String>> {
+    let url = reqwest::Url::parse(raw_url).ok()?;
+    if !is_oauth_callback_url(&url) {
+        return None;
+    }
+
+    let mut code = None;
+    let mut auth_code = None;
+    let mut state = None;
+    let mut error = None;
+    let mut error_description = None;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "code" => code = Some(value.into_owned()),
+            "authCode" => auth_code = Some(value.into_owned()),
+            "state" => state = Some(value.into_owned()),
+            "error" => error = Some(value.into_owned()),
+            "error_description" => error_description = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+
+    let error = error.unwrap_or_default().trim().to_string();
+    if !error.is_empty() {
+        let description = error_description.unwrap_or_default().trim().to_string();
+        let detail = if description.is_empty() {
+            error
+        } else {
+            format!("{}: {}", error, description)
+        };
+        return Some(Err(format!("OAuth 登录被拒绝:{}", detail)));
+    }
+
+    let code = code.or(auth_code).unwrap_or_default().trim().to_string();
+    let state = state.unwrap_or_default().trim().to_string();
+    if code.is_empty() || state.is_empty() {
+        return Some(Err("OAuth 回调缺少 code 或 state".to_string()));
+    }
+    Some(Ok(CallbackData { code, state }))
+}
+
+fn is_oauth_callback_url(url: &reqwest::Url) -> bool {
+    if url.scheme() != "zcode" {
+        return false;
+    }
+
+    let path = url.path().trim_end_matches('/');
+    match url.host_str() {
+        Some("oauth") => path == "/callback",
+        None => path == "/oauth/callback",
+        _ => false,
+    }
+}
+
+/// 将 deep link 回调投递给当前 OAuth 流程。
+///
+/// 返回值表示该 URL 是否是本应用的 OAuth 回调；普通命令行参数会被忽略。
+pub fn handle_deep_link_url(raw_url: &str) -> bool {
+    let raw_url = raw_url.trim().trim_matches(['"', '\'']);
+    let Some(result) = callback_data_from_url(raw_url) else {
+        return false;
     };
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .map_err(|e| format!("本地 OAuth 回调端口启动失败:{}", e))?;
-    let addr: SocketAddr = listener
-        .local_addr()
-        .map_err(|e| format!("读取本地 OAuth 回调端口失败:{}", e))?;
-    let app = Router::new()
-        .route(CALLBACK_PATH, get(oauth_callback))
-        .with_state(server_state);
-    tokio::spawn(async move {
-        let server = axum::serve(listener, app).with_graceful_shutdown(async {
-            let _ = shutdown_rx.await;
-        });
-        let _ = server.await;
-    });
-    let redirect_uri = format!("http://{}{}", addr, CALLBACK_PATH);
-    let _ = state;
-    Ok((redirect_uri, receiver, shutdown))
+    let sender = {
+        let Ok(pending) = pending_callback().lock() else {
+            return true;
+        };
+        let Some(pending) = pending.as_ref() else {
+            return true;
+        };
+        let result = match result {
+            Ok(callback) if callback.state != pending.state => {
+                Err("OAuth state 校验失败，请重新发起登录".to_string())
+            }
+            other => other,
+        };
+        let sender = pending
+            .sender
+            .lock()
+            .ok()
+            .and_then(|mut sender| sender.take());
+        sender.map(|sender| (sender, result))
+    };
+    if let Some((sender, result)) = sender {
+        let _ = sender.send(result);
+    }
+    true
+}
+
+fn cancel_callback_sender(
+    sender: &Arc<Mutex<Option<oneshot::Sender<Result<CallbackData, String>>>>>,
+    message: &str,
+) {
+    if let Ok(mut sender) = sender.lock() {
+        if let Some(sender) = sender.take() {
+            let _ = sender.send(Err(message.to_string()));
+        }
+    }
+}
+
+fn clear_pending_callback(state: &str) {
+    if let Ok(mut pending) = pending_callback().lock() {
+        if pending
+            .as_ref()
+            .is_some_and(|current| current.state == state)
+        {
+            pending.take();
+        }
+    }
+}
+
+fn cancel_pending_oauth(message: &str) {
+    if let Ok(mut pending) = pending_flow().lock() {
+        if let Some(flow) = pending.take() {
+            cancel_callback_sender(&flow.callback_sender, message);
+        }
+    }
+    if let Ok(mut pending) = pending_callback().lock() {
+        if let Some(callback) = pending.take() {
+            cancel_callback_sender(&callback.sender, message);
+        }
+    }
 }
 
 /// 初始化新版 Z.ai OAuth 流程。
 ///
 /// 为了兼容前端旧接口字段：
 /// - flow_id = state
-/// - poll_token = redirect_uri
+/// - poll_token = 固定回调地址（保留旧字段名以兼容前端）
 #[tauri::command]
 pub async fn oauth_init() -> Result<OAuthInit, String> {
     let state = random_hex(24);
-    let (redirect_uri, receiver, shutdown) = start_callback_server(state.clone()).await?;
-    let authorize_url = build_authorize_url(&state, &redirect_uri)?;
+    let (callback_sender, receiver) = callback_channel();
+    let authorize_url = build_authorize_url(&state)?;
 
     let mut pending = pending_flow()
         .lock()
         .map_err(|_| "OAuth 流程状态锁定失败".to_string())?;
-    if let Some(mut old) = pending.take() {
-        if let Some(shutdown) = old.shutdown.take() {
-            let _ = shutdown.send(());
-        }
+    if let Some(old) = pending.take() {
+        cancel_callback_sender(&old.callback_sender, "OAuth 登录流程已被新的登录请求替换");
     }
+    let mut slot = pending_callback()
+        .lock()
+        .map_err(|_| "OAuth 回调状态锁定失败".to_string())?;
+    if let Some(old) = slot.take() {
+        cancel_callback_sender(&old.sender, "OAuth 登录流程已被新的登录请求替换");
+    }
+    *slot = Some(PendingCallback {
+        state: state.clone(),
+        sender: callback_sender.clone(),
+    });
     *pending = Some(PendingFlow {
         state: state.clone(),
-        redirect_uri: redirect_uri.clone(),
         receiver,
-        shutdown: Some(shutdown),
+        callback_sender,
     });
 
     Ok(OAuthInit {
         flow_id: state,
         authorize_url,
-        poll_token: redirect_uri,
+        poll_token: CALLBACK_URI.to_string(),
     })
 }
 
@@ -364,7 +359,7 @@ pub async fn oauth_acquire_and_import(
             .lock()
             .map_err(|_| "OAuth 流程状态锁定失败".to_string())?;
         match guard.take() {
-            Some(flow) if flow.state == flow_id && flow.redirect_uri == poll_token => flow,
+            Some(flow) if flow.state == flow_id && poll_token == CALLBACK_URI => flow,
             Some(flow) => {
                 *guard = Some(flow);
                 return Err("OAuth 流程不匹配，请重新发起登录".into());
@@ -373,8 +368,15 @@ pub async fn oauth_acquire_and_import(
         }
     };
 
+    let state = pending.state.clone();
     let profile = acquire_with_pending(pending, deadline_seconds).await;
+    clear_pending_callback(&state);
     profile
+}
+
+#[tauri::command]
+pub fn oauth_cancel() {
+    cancel_pending_oauth("OAuth 登录流程已取消，请重新发起登录");
 }
 
 async fn acquire_with_pending(
@@ -383,34 +385,23 @@ async fn acquire_with_pending(
 ) -> Result<crate::profile::Profile, String> {
     let PendingFlow {
         state,
-        redirect_uri,
         receiver,
-        mut shutdown,
+        callback_sender: _,
     } = pending;
     let deadline = Duration::from_secs(deadline_seconds.unwrap_or(DEFAULT_DEADLINE_SECONDS));
     let callback = match tokio::time::timeout(deadline, receiver).await {
         Ok(Ok(Ok(callback))) => callback,
-        Ok(Ok(Err(e))) => {
-            shutdown_pending(&mut shutdown);
-            return Err(e);
-        }
-        Ok(Err(_)) => {
-            shutdown_pending(&mut shutdown);
-            return Err("OAuth 回调通道已关闭，请重新发起登录".into());
-        }
-        Err(_) => {
-            shutdown_pending(&mut shutdown);
-            return Err("等待 OAuth 登录超时".into());
-        }
+        Ok(Ok(Err(e))) => return Err(e),
+        Ok(Err(_)) => return Err("OAuth 回调通道已关闭，请重新发起登录".into()),
+        Err(_) => return Err("等待 OAuth 登录超时".into()),
     };
-    shutdown_pending(&mut shutdown);
 
     if callback.state != state {
         return Err("OAuth state 校验失败，请重新发起登录".into());
     }
 
     let client = http_client()?;
-    let token_data = exchange_oauth_token(&client, &callback.code, &redirect_uri, &state).await?;
+    let token_data = exchange_oauth_token(&client, &callback.code, &state).await?;
     let zcode_jwt = token_data
         .token
         .as_deref()
@@ -443,16 +434,9 @@ async fn acquire_with_pending(
     )
 }
 
-fn shutdown_pending(shutdown: &mut Option<oneshot::Sender<()>>) {
-    if let Some(shutdown) = shutdown.take() {
-        let _ = shutdown.send(());
-    }
-}
-
 async fn exchange_oauth_token(
     client: &Client,
     code: &str,
-    redirect_uri: &str,
     state: &str,
 ) -> Result<TokenData, String> {
     let resp = client
@@ -460,7 +444,7 @@ async fn exchange_oauth_token(
         .json(&serde_json::json!({
             "provider": "zai",
             "code": code,
-            "redirect_uri": redirect_uri,
+            "redirect_uri": CALLBACK_URI,
             "state": state,
         }))
         .send()
@@ -659,4 +643,49 @@ fn import_from_token_set(
     let portable_text =
         serde_json::to_string(&portable).map_err(|e| format!("portable 序列化失败:{}", e))?;
     crate::profile::import_profile_json(portable_text).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authorize_url_uses_registered_callback() {
+        let url = build_authorize_url("state-123").expect("authorize URL should build");
+        let parsed = reqwest::Url::parse(&url).expect("authorize URL should parse");
+        let params: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+
+        assert_eq!(params.get("redirect_uri"), Some(&CALLBACK_URI.to_string()));
+        assert_eq!(params.get("state"), Some(&"state-123".to_string()));
+        assert_eq!(params.get("response_type"), Some(&"code".to_string()));
+        assert_eq!(params.get("client_id"), Some(&CLIENT_ID.to_string()));
+    }
+
+    #[test]
+    fn parses_success_callback_and_ignores_other_urls() {
+        let callback =
+            callback_data_from_url("zcode://oauth/callback?code=abc%20123&state=state-123")
+                .expect("registered callback should be recognized")
+                .expect("valid callback should parse");
+        assert_eq!(callback.code, "abc 123");
+        assert_eq!(callback.state, "state-123");
+
+        let callback = callback_data_from_url("zcode:/oauth/callback?code=abc&state=state-123")
+            .expect("path-style callback should be recognized")
+            .expect("path-style callback should parse");
+        assert_eq!(callback.code, "abc");
+
+        assert!(callback_data_from_url("https://example.com/oauth/callback").is_none());
+    }
+
+    #[test]
+    fn parses_oauth_error_callback() {
+        let error = callback_data_from_url(
+            "zcode://oauth/callback?error=access_denied&error_description=User%20cancelled",
+        )
+        .expect("registered callback should be recognized")
+        .expect_err("error callback should fail");
+        assert!(error.contains("access_denied"));
+        assert!(error.contains("User cancelled"));
+    }
 }

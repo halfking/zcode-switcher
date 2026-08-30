@@ -308,9 +308,22 @@ async fn fetch_billing_balance(
     }
 
     Err(format!(
-        "额度明细获取失败：{}",
-        last_error.unwrap_or_else(|| "未能请求 billing/balance".into())
+        "套餐额度刷新失败：{}",
+        friendly_balance_error(last_error.as_deref())
     ))
+}
+
+fn friendly_balance_error(error: Option<&str>) -> &'static str {
+    let Some(error) = error else {
+        return "请打开 ZCode 或切换账号后重试";
+    };
+    if error.contains("请求超时") || error.to_ascii_lowercase().contains("timeout") {
+        return "请求超时";
+    }
+    if error.contains("429") || error.contains("限流") {
+        return "请求过于频繁，请稍后重试";
+    }
+    "请打开 ZCode 或切换账号后重试"
 }
 
 #[cfg(test)]

@@ -55,7 +55,7 @@ export interface BatchImportReport {
   messages: string[];
 }
 
-/** OAuth 初始化响应:用 authorize_url 让用户在浏览器登录,留 pollToken 给后续 acquire 用 */
+/** OAuth 初始化响应:authorize_url 使用固定 zcode://oauth/callback, pollToken 保留兼容字段 */
 export interface OAuthInit {
   flow_id: string;
   authorize_url: string;
@@ -150,6 +150,7 @@ export const api = {
         deadlineSeconds: deadlineSeconds ?? null,
       }
     ),
+  oauthCancel: () => cmd<void>("oauth_cancel"),
   listCustomProviders: () => cmd<CustomProviderView[]>("list_custom_providers"),
   addCustomProvider: (
     name: string,

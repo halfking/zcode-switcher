@@ -56,8 +56,8 @@ macOS 安装包尚未完成 Apple Developer ID 公证，首次打开可能需要
 
 ## 使用流程
 
-1. 先在 ZCode 中正常登录一个账号，也可以使用 [Zcode-register](https://github.com/sui-bian-ovo/Zcode-register) 进行自动注册与自动 ZCode 客户端授权登录。
-2. 打开 ZCode Switcher，点击“刷新”按钮后，点击“保存当前账号”，把当前登录态保存到本地账号库。
+1. 先在 ZCode 中正常登录一个账号。
+2. 打开 ZCode Switcher，点击“保存当前账号”，把当前登录态保存到本地账号库。
 3. 如需添加更多账号，可以先在 ZCode 中切换登录，也可以在工具中使用 OAuth 登录添加或导入 JSON / ZIP 备份文件。
 4. 账号保存后，会在列表中显示昵称、订阅到期时间、额度进度条和刷新状态。
 5. 开启“无感切换”后，点击账号卡片的切换按钮即可切换账号。切换过程无需重启 ZCode，账号配置会即时生效。
