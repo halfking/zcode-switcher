@@ -10,6 +10,7 @@ import {
   type QuotaInfo,
 } from "./lib/api";
 import { glm52Remaining } from "./lib/glm52";
+import { primaryQuotaRemaining } from "./lib/quotaSort";
 import { getTexts, type Language } from "./i18n";
 
 export type ToastKind = "info" | "success" | "error" | "warn";
@@ -161,11 +162,11 @@ function orderedProfilesForRefresh(
       case "name-desc":
         return b.name.localeCompare(a.name, undefined, { numeric: true });
       case "quota-desc":
-        return (glm52Remaining(state.quotas[b.id]) ?? -1) -
-          (glm52Remaining(state.quotas[a.id]) ?? -1);
+        return (primaryQuotaRemaining(state.quotas[b.id]) ?? -1) -
+          (primaryQuotaRemaining(state.quotas[a.id]) ?? -1);
       case "quota-asc":
-        return (glm52Remaining(state.quotas[a.id]) ?? Number.MAX_SAFE_INTEGER) -
-          (glm52Remaining(state.quotas[b.id]) ?? Number.MAX_SAFE_INTEGER);
+        return (primaryQuotaRemaining(state.quotas[a.id]) ?? Number.MAX_SAFE_INTEGER) -
+          (primaryQuotaRemaining(state.quotas[b.id]) ?? Number.MAX_SAFE_INTEGER);
       case "expiry-asc":
         return (state.quotas[a.id]?.plan_ends_at ?? Number.MAX_SAFE_INTEGER) -
           (state.quotas[b.id]?.plan_ends_at ?? Number.MAX_SAFE_INTEGER);

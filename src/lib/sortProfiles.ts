@@ -1,5 +1,5 @@
 import type { ProfileView, QuotaInfo } from "./api";
-import { glm52Remaining } from "./glm52";
+import { primaryQuotaRemaining } from "./quotaSort";
 import type { AccountSortMode } from "../store";
 
 /** 排序账号列表：active 永远置顶，缺数据的账号排最后 */
@@ -19,15 +19,15 @@ export function sortProfiles(
       case "name-desc":
         return b.name.localeCompare(a.name, undefined, { numeric: true });
       case "quota-desc": {
-        // 多 → 少：缺数据的视为 -1，排最后
-        const ar = glm52Remaining(quotas[a.id]) ?? -1;
-        const br = glm52Remaining(quotas[b.id]) ?? -1;
+        // 多 → 少：缺数据的视为 -1，排最后；不绑定固定模型名
+        const ar = primaryQuotaRemaining(quotas[a.id]) ?? -1;
+        const br = primaryQuotaRemaining(quotas[b.id]) ?? -1;
         return br - ar;
       }
       case "quota-asc": {
-        // 少 → 多：缺数据的视为很大，排最后
-        const ar = glm52Remaining(quotas[a.id]) ?? Number.MAX_SAFE_INTEGER;
-        const br = glm52Remaining(quotas[b.id]) ?? Number.MAX_SAFE_INTEGER;
+        // 少 → 多：缺数据的视为很大，排最后；不绑定固定模型名
+        const ar = primaryQuotaRemaining(quotas[a.id]) ?? Number.MAX_SAFE_INTEGER;
+        const br = primaryQuotaRemaining(quotas[b.id]) ?? Number.MAX_SAFE_INTEGER;
         return ar - br;
       }
       case "expiry-asc": {
