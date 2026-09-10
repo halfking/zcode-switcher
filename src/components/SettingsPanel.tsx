@@ -22,7 +22,7 @@ import { api } from "../lib/api";
 import { formatText, getTexts, type Language } from "../i18n";
 import { UpdateModal } from "./Modal";
 
-const PROJECT_HOMEPAGE_URL = "https://github.com/git-l-1031/zcode-switcher";
+const PROJECT_HOMEPAGE_URL = "https://github.com/halfking/zcode-switcher";
 
 function Toggle({
   on,

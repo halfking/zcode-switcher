@@ -6,20 +6,20 @@
 
 <br />
 
-<img src="https://raw.githubusercontent.com/git-l-1031/zcode-switcher/main/src/assets/zcode-logo.png" alt="ZCode Switcher Logo" width="132" />
+<img src="https://raw.githubusercontent.com/halfking/zcode-switcher/main/src/assets/zcode-logo.png" alt="ZCode Switcher Logo" width="132" />
 
 <p><strong>A desktop tool for managing and seamlessly switching ZCode accounts</strong></p>
 <p>Local account vault · Quota display · Auto switching · Capsule floating window · In-app updates</p>
 
-[![Release](https://img.shields.io/github/v/release/git-l-1031/zcode-switcher?style=flat-square)](https://github.com/git-l-1031/zcode-switcher/releases)
-[![Downloads](https://img.shields.io/github/downloads/git-l-1031/zcode-switcher/total?style=flat-square)](https://github.com/git-l-1031/zcode-switcher/releases)
-[![Last Commit](https://img.shields.io/github/last-commit/git-l-1031/zcode-switcher?style=flat-square)](https://github.com/git-l-1031/zcode-switcher/commits/main)
-[![Windows](https://img.shields.io/badge/Windows-10%2B-0078D4?style=flat-square&logo=windows&logoColor=white)](https://github.com/git-l-1031/zcode-switcher/releases)
-[![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon-000000?style=flat-square&logo=apple&logoColor=white)](https://github.com/git-l-1031/zcode-switcher/releases)
+[![Release](https://img.shields.io/github/v/release/halfking/zcode-switcher?style=flat-square)](https://github.com/halfking/zcode-switcher/releases)
+[![Downloads](https://img.shields.io/github/downloads/halfking/zcode-switcher/total?style=flat-square)](https://github.com/halfking/zcode-switcher/releases)
+[![Last Commit](https://img.shields.io/github/last-commit/halfking/zcode-switcher?style=flat-square)](https://github.com/halfking/zcode-switcher/commits/main)
+[![Windows](https://img.shields.io/badge/Windows-10%2B-0078D4?style=flat-square&logo=windows&logoColor=white)](https://github.com/halfking/zcode-switcher/releases)
+[![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon-000000?style=flat-square&logo=apple&logoColor=white)](https://github.com/halfking/zcode-switcher/releases)
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-24C8DB?style=flat-square&logo=tauri&logoColor=white)](https://tauri.app/)
 [![React](https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react&logoColor=222)](https://react.dev/)
 
-[Download Latest](https://github.com/git-l-1031/zcode-switcher/releases) · [Usage Guide](docs/usage.md) · [Changelog](docs/changelog.md)
+[Download Latest](https://github.com/halfking/zcode-switcher/releases) · [Usage Guide](docs/usage.md) · [Changelog](docs/changelog.md)
 
 </div>
 
@@ -47,7 +47,7 @@ All account profiles are stored on your own computer and are not uploaded to any
 
 ## Download
 
-Download the installer for your platform from [Releases](https://github.com/git-l-1031/zcode-switcher/releases):
+Download the installer for your platform from [Releases](https://github.com/halfking/zcode-switcher/releases):
 
 - Windows x64: `ZCode.Switcher_x.x.x_x64-setup.exe`
 - macOS Apple Silicon beta: `ZCode.Switcher_x.x.x_aarch64.dmg`

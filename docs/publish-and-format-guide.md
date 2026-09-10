@@ -129,7 +129,7 @@ https://example.com
         "zh": "版本提醒"
       },
       "body": {
-        "zh": "<red>重要：</red>新版已发布，详情见 <link url=\"https://github.com/git-l-1031/zcode-switcher/releases\">发布页</link>。安装包可点 <link url=\"https://github.com/git-l-1031/zcode-switcher/releases/latest\" browser=\"false\">获取</link>。"
+        "zh": "<red>重要：</red>新版已发布，详情见 <link url=\"https://github.com/halfking/zcode-switcher/releases\">发布页</link>。安装包可点 <link url=\"https://github.com/halfking/zcode-switcher/releases/latest\" browser=\"false\">获取</link>。"
       },
       "level": "info",
       "date": "2026-06-26",
@@ -186,6 +186,6 @@ node scripts/preview-notice.mjs --input public/notice.json --port 4178 --lang zh
 
 - Release 页面中是否有 Windows 安装包。
 - Release 附件中是否有 `latest.json`。
-- 访问 `https://github.com/git-l-1031/zcode-switcher/releases/latest/download/latest.json` 是否不是 404。
+- 访问 `https://github.com/halfking/zcode-switcher/releases/latest/download/latest.json` 是否不是 404。
 - 软件内检测更新是否能看到 `docs/changelog.md` 对应版本说明。
 - 公告按钮是否能读取最新 `public/notice.json`。

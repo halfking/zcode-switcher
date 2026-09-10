@@ -5,7 +5,7 @@
 ## 应用内更新
 
 - 软件会从 GitHub Releases 检查更新：
-  `https://github.com/git-l-1031/zcode-switcher/releases/latest/download/latest.json`
+  `https://github.com/halfking/zcode-switcher/releases/latest/download/latest.json`
 - 更新验签公钥保存在 `src-tauri/tauri.conf.json`。
 - 更新签名私钥不能提交到仓库。
 - 请把更新签名私钥保存在本机安全位置，并把私钥全文写入 GitHub Actions Secrets。
@@ -14,9 +14,9 @@
 
 ## macOS DMG
 
-- macOS 源码与构建流水线放在 `git-l-1031/zcode-switcher-mac`。
+- macOS 源码与构建流水线放在 `halfking/zcode-switcher-mac`。
 - DMG 构建成功后作为 workflow artifact 保存；需要发布时，手动构建可通过
-  `release_tag` 输入把 DMG 上传到 `git-l-1031/zcode-switcher` 的现有 Release。
+  `release_tag` 输入把 DMG 上传到 `halfking/zcode-switcher` 的现有 Release。
 - 跨仓库上传需要在 Mac 仓库配置仅对正式仓库具有 Release 写权限的
   `RELEASE_REPO_TOKEN`。
 - 正式公开发布前必须补 Apple Developer ID 签名与公证；当前流水线先用 ad-hoc 签名保证应用包完整性，仍按内测包发布。
@@ -45,7 +45,7 @@ GitHub Actions 会自动创建 Release，并上传安装包和应用内更新所
 
 ## 检测更新失败排查
 
-- 访问 `https://github.com/git-l-1031/zcode-switcher/releases/latest/download/latest.json`。
+- 访问 `https://github.com/halfking/zcode-switcher/releases/latest/download/latest.json`。
 - 如果返回 `404`，说明当前最新 Release 没有上传更新清单，需要重新发布带 `latest.json` 的版本。
 - 如果能打开 JSON，但软件提示验签失败，检查 GitHub Secrets 中的签名私钥是否和 `src-tauri/tauri.conf.json` 中的公钥匹配。
 - 如果能打开 JSON 且验签正常，但软件提示已是最新版本，说明当前安装版本不低于 Release 版本。

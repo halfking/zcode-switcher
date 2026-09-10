@@ -23,7 +23,7 @@ export interface NoticeLoadResult {
 }
 
 const REMOTE_NOTICE_URL =
-  "https://raw.githubusercontent.com/git-l-1031/zcode-switcher/main/public/notice.json";
+  "https://raw.githubusercontent.com/halfking/zcode-switcher/main/public/notice.json";
 const LOCAL_NOTICE_URL = "/notice.json";
 const NOTICE_TIMEOUT_MS = 5000;
 const SEEN_NOTICE_IDS_KEY = "zcode-switcher:seen-notice-ids";
