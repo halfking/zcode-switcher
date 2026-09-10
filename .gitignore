@@ -30,3 +30,4 @@ refresh-desktop-icon-cache.bat
 *.njsproj
 *.sln
 *.sw?
+.zcode/
