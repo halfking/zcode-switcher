@@ -1,22 +1,21 @@
-//! ZCode 启动快捷方式管理：为 ZCode.exe 的 .lnk 快捷方式追加
-//! `--remote-debugging-port=9229` 参数，让我们能通过 CDP 远程触发"刷新"
-//! 而无需杀进程或等待轮询。
-//!
-//! 设计：
-//! - 扫描桌面 / 开始菜单 / 任务栏固定项三处常见快捷方式位置。
-//! - 用 Win32 IShellLinkW + IPersistFile 读写 .lnk。
-//! - 把修改前的 Arguments 备份到 settings 文件中以便一键还原。
-//! - 仅匹配 target 文件名为 ZCode.exe 的 .lnk，避免误改其他程序。
+//! ZCode 增强启动：Windows 改写并备份 .lnk 参数；macOS 保存 Switcher
+//! 私有启动设置，通过 open --args 启动，不改动已签名的应用包。
 
+#[cfg(target_os = "windows")]
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
+#[cfg(target_os = "windows")]
+use serde::Deserialize;
+use serde::Serialize;
 
 use crate::profile::AppError;
 
 type R<T> = std::result::Result<T, AppError>;
 
 pub const REMOTE_DEBUGGING_FLAG: &str = "--remote-debugging-port=9229";
+
+#[cfg(target_os = "macos")]
+mod macos;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ShortcutInfo {
@@ -26,6 +25,7 @@ pub struct ShortcutInfo {
     pub has_flag: bool,
 }
 
+#[cfg(target_os = "windows")]
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct LauncherBackup {
     /// 快捷方式路径 → 修改前的原 arguments（用于还原）
@@ -33,11 +33,13 @@ struct LauncherBackup {
     original_args: std::collections::HashMap<String, String>,
 }
 
+#[cfg(target_os = "windows")]
 fn backup_file() -> R<PathBuf> {
     // switcher 内部备份放稳定的设置目录（home 基址），不随 ZCode dataBaseDir 变动
     Ok(crate::profile::zcode_settings_dir()?.join("zcode-switcher-launcher-backup.json"))
 }
 
+#[cfg(target_os = "windows")]
 fn load_backup() -> LauncherBackup {
     let Ok(path) = backup_file() else {
         return LauncherBackup::default();
@@ -48,6 +50,7 @@ fn load_backup() -> LauncherBackup {
     serde_json::from_str(&text).unwrap_or_default()
 }
 
+#[cfg(target_os = "windows")]
 fn save_backup(backup: &LauncherBackup) -> R<()> {
     let path = backup_file()?;
     if let Some(parent) = path.parent() {
@@ -63,17 +66,25 @@ pub fn scan_zcode_shortcuts() -> R<Vec<ShortcutInfo>> {
     win::scan_zcode_shortcuts()
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+pub fn scan_zcode_shortcuts() -> R<Vec<ShortcutInfo>> {
+    macos::scan_zcode_shortcuts()
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn scan_zcode_shortcuts() -> R<Vec<ShortcutInfo>> {
     Ok(vec![])
 }
 
 /// 返回第一个指向 ZCode.exe 且带 --remote-debugging-port=9229 参数的快捷方式（按 has_flag 优先）。
 /// 给 restart_zcode 用：重启时优先走带 flag 的快捷方式，保住 CDP 端口。
+#[cfg(not(target_os = "macos"))]
 pub fn find_preferred_shortcut() -> Option<ShortcutInfo> {
     let list = scan_zcode_shortcuts().unwrap_or_default();
     // 优先带 flag 的；没有再退到任意一个
-    list.iter().find(|s| s.has_flag).cloned()
+    list.iter()
+        .find(|s| s.has_flag)
+        .cloned()
         .or_else(|| list.into_iter().next())
 }
 
@@ -83,9 +94,14 @@ pub fn enable_remote_debug() -> R<(usize, usize, usize)> {
     win::enable_remote_debug()
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
 pub fn enable_remote_debug() -> R<(usize, usize, usize)> {
-    Ok((0, 0, 0))
+    macos::enable_remote_debug()
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub fn enable_remote_debug() -> R<(usize, usize, usize)> {
+    Err(AppError::Msg("当前平台不支持增强启动".into()))
 }
 
 /// 还原所有曾修改过的快捷方式 arguments；返回还原数量。
@@ -94,9 +110,28 @@ pub fn disable_remote_debug() -> R<usize> {
     win::disable_remote_debug()
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
 pub fn disable_remote_debug() -> R<usize> {
-    Ok(0)
+    macos::disable_remote_debug()
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub fn disable_remote_debug() -> R<usize> {
+    Err(AppError::Msg("当前平台不支持增强启动".into()))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    #[test]
+    #[ignore = "requires ZCode installed in /Applications; read-only"]
+    fn installed_macos_application_is_discovered() {
+        assert!(std::path::Path::new("/Applications/ZCode.app/Contents/MacOS/ZCode").is_file());
+        let entries = super::scan_zcode_shortcuts().unwrap();
+        assert!(
+            !entries.is_empty(),
+            "installed ZCode must not be reported as missing"
+        );
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -114,8 +149,8 @@ mod win {
     };
     use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
 
-    use super::{LauncherBackup, ShortcutInfo, REMOTE_DEBUGGING_FLAG};
     use super::{backup_file, load_backup, save_backup};
+    use super::{LauncherBackup, ShortcutInfo, REMOTE_DEBUGGING_FLAG};
     use crate::profile::AppError;
 
     type R<T> = std::result::Result<T, AppError>;
@@ -208,8 +243,7 @@ mod win {
     fn read_shortcut(lnk_path: &Path) -> windows::core::Result<(String, String)> {
         ensure_com_init();
         unsafe {
-            let link: IShellLinkW =
-                CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
+            let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
             let persist: IPersistFile = link.cast()?;
 
             let lnk_wide = to_wide(&lnk_path.to_string_lossy());
@@ -232,8 +266,7 @@ mod win {
     fn write_shortcut_arguments(lnk_path: &Path, args: &str) -> windows::core::Result<()> {
         ensure_com_init();
         unsafe {
-            let link: IShellLinkW =
-                CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
+            let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
             let persist: IPersistFile = link.cast()?;
 
             let lnk_wide = to_wide(&lnk_path.to_string_lossy());

@@ -113,14 +113,23 @@ function NoRestartSwitchRow({
 }) {
   const t = getTexts(language);
   const [shortcuts, setShortcuts] = useState<ShortcutInfo[] | null>(null);
+  const [scanFailed, setScanFailed] = useState(false);
   const [busy, setBusy] = useState(false);
 
   const refresh = async () => {
+    setScanFailed(false);
     try {
       const arr = await invoke<ShortcutInfo[]>("zcode_launcher_scan");
       setShortcuts(arr);
+      // On macOS the scan is the source of truth: a discovered but disabled app
+      // must not inherit a stale persisted toggle state.
+      if (IS_MACOS) {
+        const allEnabled = arr.length > 0 && arr.every((s) => s.has_flag ?? s.hasFlag);
+        setOn(allEnabled);
+      }
     } catch {
-      setShortcuts([]);
+      setScanFailed(true);
+      setShortcuts(null);
     }
   };
 
@@ -132,13 +141,17 @@ function NoRestartSwitchRow({
   const total = (shortcuts ?? []).length;
 
   let status = IS_MACOS ? t.launcherEnhanceStatusNoneMac : t.launcherEnhanceStatusNone;
-  if (total > 0) {
+  if (shortcuts === null) {
+    status = scanFailed ? t.launcherEnhanceStatusScanFailed : t.launcherEnhanceStatusLoading;
+  } else if (total > 0) {
     status =
       enabled === total
         ? IS_MACOS
           ? t.launcherEnhanceStatusAllMac
           : formatText(t.launcherEnhanceStatusAll, { total })
-        : formatText(t.launcherEnhanceStatusPartial, { enabled, total });
+        : IS_MACOS && enabled === 0
+          ? t.launcherEnhanceStatusDisabledMac
+          : formatText(t.launcherEnhanceStatusPartial, { enabled, total });
   }
 
   const desc = `${IS_MACOS ? t.noRestartDescMac : t.noRestartDesc}\n${status}`;
@@ -146,34 +159,51 @@ function NoRestartSwitchRow({
   const handleToggle = async () => {
     if (busy) return;
     if (on) {
-      setOn(false);
+      if (!IS_MACOS) {
+        setOn(false);
+        return;
+      }
+      setBusy(true);
+      try {
+        await invoke<number>("zcode_launcher_disable");
+        setOn(false);
+        toast(t.launcherEnhanceDisabledToastMac, "success");
+        await refresh();
+      } catch (e) {
+        toast(formatText(t.launcherEnhanceFailedToast, { error: String(e) }), "error");
+      } finally {
+        setBusy(false);
+      }
       return;
     }
-    // 打开：先翻 toggle，再改快捷方式；改写失败也不回滚 toggle
-    setOn(true);
     setBusy(true);
     try {
       const res = await invoke<{ modified: number; already: number; total: number }>(
         "zcode_launcher_enable"
       );
       if (res.total === 0) {
+        setOn(false);
         toast(
           IS_MACOS ? t.launcherEnhanceNoneFoundToastMac : t.launcherEnhanceNoneFoundToast,
           "warn"
         );
-      } else if (IS_MACOS) {
-        toast(t.launcherEnhanceEnabledToastMac, "success");
-      } else if (res.modified > 0) {
-        toast(
-          formatText(t.launcherEnhanceEnabledToast, {
-            modified: res.modified,
-            already: res.already,
-          }),
-          "success"
-        );
+      } else {
+        setOn(true);
+        if (IS_MACOS) {
+          toast(t.launcherEnhanceEnabledToastMac, "success");
+        } else if (res.modified > 0) {
+          toast(
+            formatText(t.launcherEnhanceEnabledToast, {
+              modified: res.modified,
+              already: res.already,
+            }),
+            "success"
+          );
+        }
       }
       await refresh();
     } catch (e) {
+      setOn(false);
       toast(formatText(t.launcherEnhanceFailedToast, { error: String(e) }), "error");
     } finally {
       setBusy(false);
@@ -185,6 +215,7 @@ function NoRestartSwitchRow({
     setBusy(true);
     try {
       const restored = await invoke<number>("zcode_launcher_disable");
+      setOn(false);
       toast(
         IS_MACOS
           ? t.launcherEnhanceDisabledToastMac
