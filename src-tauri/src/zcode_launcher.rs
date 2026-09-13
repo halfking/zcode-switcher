@@ -76,6 +76,26 @@ pub fn scan_zcode_shortcuts() -> R<Vec<ShortcutInfo>> {
     Ok(vec![])
 }
 
+/// 用户是否开启过"无感切换增强"（快捷方式带 CDP flag）。
+/// 用途：ZCode 更新/重装会重建快捷方式并抹掉 flag，重启 ZCode 时据此自动补回，
+/// 不然无感切换会静默退化成"改了文件但 ZCode 没反应"。
+/// （只在 Windows restart_zcode 里消费；macOS 的 flag 存私有设置不走快捷方式。）
+#[cfg(target_os = "windows")]
+pub fn user_opted_into_remote_debug() -> bool {
+    !load_backup().original_args.is_empty()
+}
+
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+pub fn user_opted_into_remote_debug() -> bool {
+    macos::remote_debugging_opted_in()
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+pub fn user_opted_into_remote_debug() -> bool {
+    false
+}
+
 /// 返回第一个指向 ZCode.exe 且带 --remote-debugging-port=9229 参数的快捷方式（按 has_flag 优先）。
 /// 给 restart_zcode 用：重启时优先走带 flag 的快捷方式，保住 CDP 端口。
 #[cfg(not(target_os = "macos"))]

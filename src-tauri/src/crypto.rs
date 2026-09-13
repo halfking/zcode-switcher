@@ -46,9 +46,7 @@ fn derive_key() -> [u8; 32] {
         _ => {
             let username = whoami_fallback();
             let platform = platform_name();
-            let home = dirs::home_dir()
-                .map(|p| p.to_string_lossy().to_string())
-                .unwrap_or_default();
+            let home = node_style_home_dir().unwrap_or_default();
             format!(
                 "zcode-credential-fallback:{}:{}:{}",
                 platform, home, username
@@ -61,6 +59,26 @@ fn derive_key() -> [u8; 32] {
     let mut key = [0u8; 32];
     key.copy_from_slice(&out);
     key
+}
+
+/// 复刻 Node `os.homedir()` 的取值顺序：Windows 上先读 `USERPROFILE` 环境变量
+/// （libuv 的 uv_os_homedir 不看 HOME），读不到再退 known folder。
+///
+/// 之前直接用 `dirs::home_dir()`——它在 Windows 上走 `SHGetKnownFolderPath(FOLDERID_Profile)`，
+/// 与环境变量不是同一个来源。两个来源在重定向/非常规配置的机器上可能给出不同的
+/// 字符串（哪怕只差大小写），SHA256 之后就是完全不同的密钥，表现为"读取当前
+/// 用户信息全是空的/解密失败"。密钥必须和 ZCode 的取值逐字节一致。
+fn node_style_home_dir() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(v) = env::var("USERPROFILE") {
+            // Node/libuv uses USERPROFILE verbatim; trimming changes the fallback key.
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    dirs::home_dir().map(|p| p.to_string_lossy().into_owned())
 }
 
 fn platform_name() -> &'static str {
@@ -208,16 +226,12 @@ fn user_info_from_key(creds: &serde_json::Value, key: &str) -> Option<UserInfo> 
 fn parse_user_info_json(dec: &str) -> Option<UserInfo> {
     let value: serde_json::Value = serde_json::from_str(dec).ok()?;
     let nested = value.get("rawProfile");
-    let name = pick_str(&value, &["name", "displayName", "username", "nickName"]).or_else(|| {
-        nested.and_then(|item| pick_str(item, &["name", "displayName", "username"]))
-    });
-    let email = pick_str(&value, &["email"])
-        .or_else(|| nested.and_then(|item| pick_str(item, &["email"])));
-    let phone = pick_str(
-        &value,
-        &["phone", "phone_number", "mobile", "mobile_phone"],
-    )
-    .or_else(|| nested.and_then(|item| pick_str(item, &["phone", "phone_number", "mobile"])));
+    let name = pick_str(&value, &["name", "displayName", "username", "nickName"])
+        .or_else(|| nested.and_then(|item| pick_str(item, &["name", "displayName", "username"])));
+    let email =
+        pick_str(&value, &["email"]).or_else(|| nested.and_then(|item| pick_str(item, &["email"])));
+    let phone = pick_str(&value, &["phone", "phone_number", "mobile", "mobile_phone"])
+        .or_else(|| nested.and_then(|item| pick_str(item, &["phone", "phone_number", "mobile"])));
     let avatar = pick_str(&value, &["avatar", "avatarUrl", "picture"]);
     let user_id = pick_str(&value, &["user_id", "userId", "id", "sub"]);
     if name.is_none() && email.is_none() && phone.is_none() && user_id.is_none() {

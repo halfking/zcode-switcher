@@ -553,6 +553,11 @@ fn encrypt_portable_credentials(value: Value) -> R<Vec<u8>> {
     let mut out = Map::with_capacity(map.len());
     for (key, value) in map {
         let converted = match value {
+            Value::String(s) if crate::crypto::is_encrypted(&s) => {
+                return Err(AppError::Msg(
+                    "portable credentials 禁止 enc:v1: 双重加密输入".into(),
+                ));
+            }
             Value::String(s) => Value::String(crate::crypto::encrypt(&s).map_err(AppError::Msg)?),
             other => other,
         };
@@ -608,18 +613,6 @@ fn identity_key(email: &str, phone: &str, user_id: &str) -> Option<String> {
 
 fn profile_identity_key(profile: &Profile) -> Option<String> {
     identity_key(&profile.email, &profile.phone, &profile.user_id)
-}
-
-fn account_label(email: &str, phone: &str) -> String {
-    let email = normalize_email(email);
-    if !email.is_empty() {
-        return format!("邮箱 {}", email);
-    }
-    let phone = normalize_phone(phone);
-    if !phone.is_empty() {
-        return format!("手机号 {}", phone);
-    }
-    "未知账号".to_string()
 }
 
 /// 原子写入：先写 .tmp 再 rename，避免写一半导致文件损坏。
@@ -692,6 +685,81 @@ fn find_profile_by_identity<'a>(
     profiles
         .iter()
         .find(|p| profile_identity_key(p).as_deref() == Some(key.as_str()))
+}
+
+/// 当前 credentials.json 内容的 SHA256，用来判定"当前正在使用的账号快照"。
+/// 未登录 / 文件缺失 / 读取失败返回 None。
+fn current_cred_hash() -> Option<String> {
+    let path = credentials_file().ok()?;
+    let bytes = fs::read(path).ok()?;
+    Some(sha256_bytes(&bytes))
+}
+
+/// 写盘前按身份键去重（macOS/Windows/Linux 共用同一份逻辑）。
+///
+/// 同一身份（email→phone→user_id）的重复档案只保留一条，优先级：
+///   1. `cred_hash` 与当前 credentials.json 一致（即"当前正在使用"的快照）
+///   2. `updated_at` 最大（最近使用）
+///   3. `created_at` 最小（先建立的）
+///
+/// 背景：新写入路径本就按身份去重（capture_current / import），但磁盘上仍可能
+/// 残留重复记录：旧版本迁移（去重逻辑加入之前）、手工编辑 profiles.json、
+/// 同一账号一行存了邮箱另一行只有 user_id（identity_key 取值不同导致漏判）。
+/// 每次写盘前统一清扫一遍，保证档案库收敛到无重复。
+///
+/// 注：同组重复档案的身份键必然相同，"是否匹配 live identity key"在组内要么
+/// 全真要么全假，无法排序；所以"当前在用"用 cred_hash 与 live credentials.json
+/// 的哈希比对来判定（切号/捕获刚写完盘时，被操作的档案必然命中第 1 优先级）。
+fn dedup_before_save(profiles: &mut Vec<Profile>, live_cred_hash: Option<&str>) {
+    let mut groups: std::collections::BTreeMap<String, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (idx, p) in profiles.iter().enumerate() {
+        if let Some(k) = profile_identity_key(p) {
+            groups.entry(k).or_default().push(idx);
+        }
+    }
+
+    let mut drop: Vec<usize> = groups
+        .into_values()
+        .filter(|group| group.len() > 1)
+        .flat_map(|group| {
+            let mut ranked = group;
+            ranked.sort_by(|&a, &b| {
+                let live_a = live_cred_hash == Some(profiles[a].cred_hash.as_str());
+                let live_b = live_cred_hash == Some(profiles[b].cred_hash.as_str());
+                live_b
+                    .cmp(&live_a)
+                    .then_with(|| {
+                        profiles[b]
+                            .updated_at
+                            .partial_cmp(&profiles[a].updated_at)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .then_with(|| {
+                        profiles[a]
+                            .created_at
+                            .partial_cmp(&profiles[b].created_at)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+            });
+            ranked.into_iter().skip(1)
+        })
+        .collect();
+    drop.sort_unstable();
+
+    for idx in drop.into_iter().rev() {
+        let removed = profiles.remove(idx);
+        // 同身份重复档案的 id 是身份哈希，可能共享同一个 cred_file；
+        // 只有当没有任何幸存档案还引用它时才删文件，避免把在用的凭据副本删掉。
+        let still_referenced = profiles
+            .iter()
+            .any(|p| !p.cred_file.is_empty() && p.cred_file == removed.cred_file);
+        if !removed.cred_file.is_empty() && !still_referenced {
+            if let Ok(dir) = profiles_dir() {
+                let _ = fs::remove_file(dir.join(&removed.cred_file));
+            }
+        }
+    }
 }
 
 fn update_profile_from_capture(
@@ -809,6 +877,15 @@ fn prepare_config_provider_keys_update(
             return Ok(None);
         }
         target_writes.push((plain_key, apikey.clone()));
+        // 同 family 的 start-plan / coding-plan 入口按捕获时的快照原样写回（空也写）：
+        // start-plan 里可能残留上一个 oauth 账号的 JWT，不清会让 ZCode 继续用旧账号的
+        // plan 入口，表现为"切到 apikey 账号后额度/身份还是旧的"。
+        for id in [plan_start, plan_coding] {
+            let Some(value) = stored_keys.get(&id) else {
+                continue;
+            };
+            target_writes.push((id, value.clone()));
+        }
     } else {
         return Ok(None);
     }
@@ -858,6 +935,34 @@ fn prepare_config_provider_keys_update(
     Ok(Some((path, data)))
 }
 
+/// oauth 切号后 `modelProviderFamilySelectedKeys[family]` 的重定向决策。
+///
+/// ZCode 渲染层会优先按这个值选择实际使用的 provider 入口。oauth 切号清空了
+/// coding-plan / 无后缀入口的 apiKey 后，如果这里还指向它们，ZCode 就一直指着
+/// 一个空 provider（实测 Win11：用户被迫手动重新粘 API Key 才能"切换成功"）。
+///
+/// - 缺省/空 → 指向 start-plan（显式锁定 plan 入口）
+/// - 已经是 start-plan 引用 → 不动（None）
+/// - `team-plan:` 前缀（BigModel 团队版特殊路由）→ 不动
+/// - 同 family 的 coding-plan / 无后缀引用 → 重定向到 start-plan
+/// - 其它值（其它 family / 未知格式）→ 不动
+fn redirected_selected_key(current: Option<&str>, family: &str) -> Option<String> {
+    let target = format!("coding-plan:builtin:{}-start-plan", family);
+    let cur = current.map(str::trim).unwrap_or("");
+    if cur.is_empty() {
+        return Some(target);
+    }
+    if cur == target || cur.starts_with("team-plan:") {
+        return None;
+    }
+    if cur == format!("coding-plan:builtin:{}", family)
+        || cur == format!("coding-plan:builtin:{}-coding-plan", family)
+    {
+        return Some(target);
+    }
+    None
+}
+
 /// 按账号的 family/mode patch `setting.json`：
 /// - `providerFamilyDomain = family`：让 ZCode 不禁用本 family 的 provider
 /// - `modelProviderFamilyModes[family]`：ZCode 的 `m5` filter 用这个值决定走 plan 还是
@@ -866,6 +971,9 @@ fn prepare_config_provider_keys_update(
 ///   - oauth 模式 → 强制写入 `"oauth"`
 ///   - apikey 模式 → 主动**删掉**该 key（包括之前 oauth 切号时写入的"oauth"），让 ZCode
 ///     退回 apikey 路由
+/// - `modelProviderFamilySelectedKeys[family]`：ZCode 选中入口（渲染层优先按它选 provider）
+///   - oauth 模式 → 重定向到 start-plan（原指向的 coding-plan/无后缀入口刚被清空 apiKey）
+///   - apikey 模式 → 删掉，交还 ZCode 默认 apikey 路由
 ///
 /// 已经一致就跳过。setting.json 不存在 / 损坏 / 不是对象都返回 None。
 fn prepare_setting_route_update(family: &str, mode: &str) -> R<Option<(PathBuf, Vec<u8>)>> {
@@ -909,14 +1017,36 @@ fn prepare_setting_route_update(family: &str, mode: &str) -> R<Option<(PathBuf, 
                     changed = true;
                 }
             }
+            // oauth 切号后把选中入口重定向回 start-plan（见 redirected_selected_key 注释）
+            let current = obj
+                .get("modelProviderFamilySelectedKeys")
+                .and_then(|v| v.get(family))
+                .and_then(Value::as_str);
+            if let Some(next) = redirected_selected_key(current, family) {
+                let selected = obj
+                    .entry("modelProviderFamilySelectedKeys".to_string())
+                    .or_insert_with(|| Value::Object(Map::new()));
+                if let Some(selected_obj) = selected.as_object_mut() {
+                    selected_obj.insert(family.to_string(), Value::String(next));
+                    changed = true;
+                }
+            }
         }
         "apikey" => {
-            // 主动删 family 那一项，让 ZCode 退回 apikey 路由
+            // 主动删 family 那两项，让 ZCode 退回 apikey 路由
             if let Some(modes_obj) = obj
                 .get_mut("modelProviderFamilyModes")
                 .and_then(Value::as_object_mut)
             {
                 if modes_obj.remove(family).is_some() {
+                    changed = true;
+                }
+            }
+            if let Some(selected_obj) = obj
+                .get_mut("modelProviderFamilySelectedKeys")
+                .and_then(Value::as_object_mut)
+            {
+                if selected_obj.remove(family).is_some() {
                     changed = true;
                 }
             }
@@ -1048,6 +1178,9 @@ pub fn capture_current(name: String) -> R<Profile> {
             &cred_bytes,
             &metadata,
         )?;
+        // 刚捕获的档案 cred_hash 与 live credentials.json 一致，去重时必然保留。
+        let live_hash = current_cred_hash();
+        dedup_before_save(&mut profiles, live_hash.as_deref());
         save_index(&profiles)?;
         return Ok(saved);
     }
@@ -1075,6 +1208,8 @@ pub fn capture_current(name: String) -> R<Profile> {
         provider_api_keys: metadata.provider_api_keys.clone(),
     };
     profiles.push(profile.clone());
+    let live_hash = current_cred_hash();
+    dedup_before_save(&mut profiles, live_hash.as_deref());
     save_index(&profiles)?;
     Ok(profile)
 }
@@ -1163,6 +1298,10 @@ pub fn switch_to(id: String) -> R<Profile> {
     }
 
     profiles[idx].updated_at = now_ts();
+    // 切号刚把该档案的凭据原子写进 credentials.json，其 cred_hash 与 live 一致，
+    // 去重时必然保留；顺带清扫同身份的历史重复。
+    let live_hash = current_cred_hash();
+    dedup_before_save(&mut profiles, live_hash.as_deref());
     save_index(&profiles)?;
     Ok(profile)
 }
@@ -1175,15 +1314,22 @@ pub fn rename_profile(id: String, name: String) -> R<bool> {
     if trimmed.is_empty() {
         return Err(AppError::Msg("名称不能为空".into()));
     }
+    let mut found = false;
     for p in profiles.iter_mut() {
         if p.id == id {
             p.name = trimmed.to_string();
             p.updated_at = now_ts();
-            save_index(&profiles)?;
-            return Ok(true);
+            found = true;
+            break;
         }
     }
-    Ok(false)
+    if !found {
+        return Ok(false);
+    }
+    let live_hash = current_cred_hash();
+    dedup_before_save(&mut profiles, live_hash.as_deref());
+    save_index(&profiles)?;
+    Ok(true)
 }
 
 /// 删除档案（禁止删除当前活跃的）。
@@ -1194,9 +1340,9 @@ pub fn delete_profile(id: String) -> R<bool> {
     // 不允许删除当前正在使用的账号
     if let Some(identity) = current_identity() {
         let current_key = identity.key();
-        let is_active = profiles.iter().any(|p| {
-            p.id == id && current_key.as_deref() == profile_identity_key(p).as_deref()
-        });
+        let is_active = profiles
+            .iter()
+            .any(|p| p.id == id && current_key.as_deref() == profile_identity_key(p).as_deref());
         if is_active {
             return Err(AppError::Msg("不能删除当前正在使用的账号".into()));
         }
@@ -1272,6 +1418,13 @@ fn import_portable_account(portable: PortableAccount) -> R<Profile> {
     let portable_keys = portable.provider_api_keys.clone();
 
     let cred_bytes = encrypt_portable_credentials(portable.credentials)?;
+    let identity_check = extract_identity_from_credentials(&cred_bytes);
+    let has_jwt = matches!(zcode_jwt_from_credentials(&cred_bytes), Ok(Some(_)));
+    if identity_check.key().is_none() && !has_jwt {
+        return Err(AppError::Msg(
+            "credentials 缺少必需的账号身份字段，未导入".into(),
+        ));
+    }
     let cred_hash = sha256_bytes(&cred_bytes);
     let identity_from_creds = extract_identity_from_credentials(&cred_bytes);
 
@@ -1339,15 +1492,56 @@ fn import_portable_account(portable: PortableAccount) -> R<Profile> {
     };
 
     let mut profiles = load_index();
-    if let Some(existing) = profiles
-        .iter()
-        .find(|p| profile_identity_key(p).as_deref() == Some(key.as_str()))
-    {
-        return Err(AppError::Msg(format!(
-            "账号标识 {} 已存在于账号「{}」，未重复导入。",
-            account_label(&email, &phone),
-            existing.name
-        )));
+    // 先清扫磁盘上已有的重复，保证合并目标唯一（去重保留当前在用/最新的档案）。
+    let live_hash = current_cred_hash();
+    dedup_before_save(&mut profiles, live_hash.as_deref());
+
+    let merged: Option<Profile> = {
+        let mut merged_out = None;
+        if let Some(existing) = profiles
+            .iter_mut()
+            .find(|p| profile_identity_key(p).as_deref() == Some(key.as_str()))
+        {
+            // 同身份档案已存在 → 就地合并而非拒绝导入：导入方是最新快照，
+            // 凭据/family/mode/apiKey 快照整体覆盖；档案 id 和现有名字保留
+            //（用户可能已重命名，且 id 是身份哈希，改名会破坏凭据文件对应关系）。
+            if existing.cred_file.is_empty() {
+                let cred_file_name = format!("credentials.{}.json", existing.id);
+                let dir = profiles_dir()?;
+                fs::create_dir_all(&dir)?;
+                fs::write(dir.join(&cred_file_name), &cred_bytes)?;
+                existing.cred_file = cred_file_name;
+            } else {
+                fs::write(profiles_dir()?.join(&existing.cred_file), &cred_bytes)?;
+            }
+            existing.cred_hash = cred_hash.clone();
+            if existing.email.is_empty() {
+                existing.email = email.clone();
+            }
+            if existing.phone.is_empty() {
+                existing.phone = phone.clone();
+            }
+            if existing.user_id.is_empty() {
+                existing.user_id = user_id.clone();
+            }
+            if !avatar.is_empty() {
+                existing.avatar = avatar.clone();
+            }
+            if !family.is_empty() {
+                existing.family = family.clone();
+            }
+            if !mode.is_empty() {
+                existing.mode = mode.clone();
+            }
+            existing.provider_api_keys = portable_keys.clone();
+            existing.updated_at = now_ts();
+            merged_out = Some(existing.clone());
+        }
+        merged_out
+    };
+    if let Some(merged) = merged {
+        save_index(&profiles)?;
+        return Ok(merged);
     }
 
     let id = sha256_bytes(key.as_bytes())[..12].to_string();
@@ -1372,6 +1566,8 @@ fn import_portable_account(portable: PortableAccount) -> R<Profile> {
         provider_api_keys: portable_keys,
     };
     profiles.push(profile.clone());
+    let live_hash = current_cred_hash();
+    dedup_before_save(&mut profiles, live_hash.as_deref());
     save_index(&profiles)?;
     Ok(profile)
 }
@@ -1656,7 +1852,10 @@ mod tests {
             identity_key("", "+86 138-0013-8000", "u1").as_deref(),
             Some("phone:8613800138000")
         );
-        assert_eq!(identity_key("", "", "bm-user-001").as_deref(), Some("uid:bm-user-001"));
+        assert_eq!(
+            identity_key("", "", "bm-user-001").as_deref(),
+            Some("uid:bm-user-001")
+        );
         assert_eq!(identity_key("  ", "", "  "), None);
     }
 
@@ -1679,7 +1878,10 @@ mod tests {
         );
 
         let after_save = current_status().expect("status after save");
-        assert_eq!(after_save.active_profile_id.as_deref(), Some(saved.id.as_str()));
+        assert_eq!(
+            after_save.active_profile_id.as_deref(),
+            Some(saved.id.as_str())
+        );
 
         let restored = switch_to(saved.id.clone()).expect("switch_to");
         assert_eq!(restored.id, saved.id);
@@ -1690,5 +1892,57 @@ mod tests {
             Some(saved.id.as_str())
         );
         assert_eq!(after_restore.current_username, status.current_username);
+    }
+}
+
+#[cfg(test)]
+mod selected_key_tests {
+    use super::redirected_selected_key;
+
+    const START: &str = "coding-plan:builtin:bigmodel-start-plan";
+
+    #[test]
+    fn missing_or_empty_selects_start_plan() {
+        assert_eq!(
+            redirected_selected_key(None, "bigmodel").as_deref(),
+            Some(START)
+        );
+        assert_eq!(
+            redirected_selected_key(Some(""), "bigmodel").as_deref(),
+            Some(START)
+        );
+        assert_eq!(
+            redirected_selected_key(Some("  "), "bigmodel").as_deref(),
+            Some(START)
+        );
+    }
+
+    #[test]
+    fn same_family_api_entries_are_redirected_to_start_plan() {
+        assert_eq!(
+            redirected_selected_key(Some("coding-plan:builtin:bigmodel-coding-plan"), "bigmodel")
+                .as_deref(),
+            Some(START)
+        );
+        assert_eq!(
+            redirected_selected_key(Some("coding-plan:builtin:bigmodel"), "bigmodel").as_deref(),
+            Some(START)
+        );
+    }
+
+    #[test]
+    fn start_plan_team_plan_and_other_families_are_untouched() {
+        assert_eq!(redirected_selected_key(Some(START), "bigmodel"), None);
+        assert_eq!(
+            redirected_selected_key(
+                Some("team-plan:builtin:bigmodel-coding-plan:xyz"),
+                "bigmodel"
+            ),
+            None
+        );
+        assert_eq!(
+            redirected_selected_key(Some("coding-plan:builtin:zai-coding-plan"), "bigmodel"),
+            None
+        );
     }
 }

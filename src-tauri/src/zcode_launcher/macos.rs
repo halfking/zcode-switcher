@@ -134,6 +134,15 @@ pub(super) fn disable_remote_debug() -> R<usize> {
     disable_with(&settings_file()?)
 }
 
+pub(super) fn remote_debugging_opted_in() -> bool {
+    read_settings(&match settings_file() {
+        Ok(path) => path,
+        Err(_) => return false,
+    })
+    .map(|(settings, _)| settings.remote_debugging)
+    .unwrap_or(false)
+}
+
 fn scan_with(candidates: &[PathBuf], settings_path: &Path) -> R<Vec<ShortcutInfo>> {
     let (settings, _) = read_settings(settings_path)?;
     Ok(entry_for(candidates, &settings).into_iter().collect())

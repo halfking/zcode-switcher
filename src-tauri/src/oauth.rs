@@ -36,7 +36,12 @@ enum OAuthFamily {
 
 impl OAuthFamily {
     fn parse(raw: Option<&str>) -> Result<Self, String> {
-        match raw.unwrap_or("bigmodel").trim().to_ascii_lowercase().as_str() {
+        match raw
+            .unwrap_or("bigmodel")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "" | "bigmodel" => Ok(Self::BigModel),
             "zai" => Ok(Self::Zai),
             other => Err(format!("不支持的 OAuth 登录平台：{}", other)),
@@ -364,7 +369,9 @@ pub async fn oauth_init(provider: Option<String>) -> Result<OAuthInit, String> {
     let family = OAuthFamily::parse(provider.as_deref())?;
     let (callback_sender, receiver) = callback_channel();
     let client = http_client()?;
-    let cli = oauth_cli::start_cli_flow(&client, family.as_str()).await.ok();
+    let cli = oauth_cli::start_cli_flow(&client, family.as_str())
+        .await
+        .ok();
     let (state, poll_token, authorize_url, redirect_uri) = match &cli {
         Some(flow) => (
             flow.flow_id.clone(),
@@ -537,7 +544,8 @@ async fn acquire_with_pending(
         return Err("OAuth state 校验失败，请重新发起登录".into());
     }
 
-    let token_data = exchange_oauth_token(&client, family, &callback.code, &state, &redirect_uri).await?;
+    let token_data =
+        exchange_oauth_token(&client, family, &callback.code, &state, &redirect_uri).await?;
     let zcode_jwt = token_data
         .token
         .as_deref()
@@ -813,8 +821,8 @@ mod tests {
 
     #[test]
     fn authorize_url_uses_registered_callback() {
-        let url = build_authorize_url(OAuthFamily::Zai, "state-123")
-            .expect("authorize URL should build");
+        let url =
+            build_authorize_url(OAuthFamily::Zai, "state-123").expect("authorize URL should build");
         let parsed = reqwest::Url::parse(&url).expect("authorize URL should parse");
         let params: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
 
@@ -834,7 +842,10 @@ mod tests {
             .expect("authorize URL should build");
         let parsed = reqwest::Url::parse(&url).expect("authorize URL should parse");
         let params: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
-        assert_eq!(parsed.as_str().split('?').next(), Some(BIGMODEL_AUTHORIZE_URL));
+        assert_eq!(
+            parsed.as_str().split('?').next(),
+            Some(BIGMODEL_AUTHORIZE_URL)
+        );
         assert_eq!(params.get("appId"), Some(&BIGMODEL_APP_ID.to_string()));
         assert_eq!(params.get("state"), Some(&"state-456".to_string()));
         assert_eq!(

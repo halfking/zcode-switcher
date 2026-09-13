@@ -292,7 +292,10 @@ mod tests {
             "bigmodel",
         )
         .unwrap() else { panic!("ready") };
-        assert_eq!((ready.zcode_jwt, ready.access_token, ready.refresh_token), ("jwt".into(), "at".into(), "rt".into()));
+        assert_eq!(
+            (ready.zcode_jwt, ready.access_token, ready.refresh_token),
+            ("jwt".into(), "at".into(), "rt".into())
+        );
         assert_eq!(ready.user["user_id"], "u1");
     }
 }

@@ -62,27 +62,33 @@ pub fn zcode_running() -> R<Option<String>> {
 /// 切号前先杀 ZCode：autoRestart 路径下用它来避免"还没杀完 ZCode 已经把内存里的旧
 /// credentials/config 反写回磁盘盖掉我们的"。
 ///
-/// 行为：先记录当前正在运行的 exe 路径（kill 之后就枚举不到了），kill 全部 ZCode 进程，
-/// 等 800ms。后面再调 `restart_zcode` 时它会因为枚举不到运行进程而走 `load_known_path`，
-/// 加上原本就已经检测过的快捷方式，重新拉起。
+/// 行为：先记录当前正在运行的 exe 路径（kill 之后就枚举不到了），kill 全部 ZCode 进程并
+/// **等待真正退出**（Electron 多进程 + 单实例锁，固定 sleep 会在满载时提前返回——实测
+/// 40+ 进程的实例强杀后 ~1s 才退干净），后面再调 `restart_zcode` 时它会因为枚举不到
+/// 运行进程而走 `load_known_path`，加上原本就已经检测过的快捷方式，重新拉起。
 #[tauri::command]
 pub fn kill_zcode_for_switch() -> R<()> {
     let path = find_main_path();
     if let Some(ref p) = path {
         let _ = save_known_path(p);
     }
-    kill_all_zcode();
-    thread::sleep(Duration::from_millis(800));
+    kill_all_zcode_and_wait()?;
     Ok(())
 }
 
-/// 重启 ZCode：kill 全部同名进程 → 等待 800ms → 优先按用户的快捷方式重启，回落到 exe 直拉。
+/// 重启 ZCode：kill 全部同名进程 → **等待真正退出** → 优先按用户的快捷方式重启，回落到 exe 直拉。
 /// - 找不到运行中的 ZCode：直接尝试启动（若有已知路径）。
 /// - 找不到 exe 路径：返回错误。
+/// - spawn 后轮询确认进程真的起来了；起不来（如旧实例单实例锁未释放）就报错，
+///   而不是假成功让用户再点一次。
 ///
 /// 为什么"快捷方式优先"：用户可能通过我们的"无感切换增强"在快捷方式上加了
 /// `--remote-debugging-port=9229`，直接拉 exe 会丢失这些参数（CDP 端口不开 → 下次切号回落
 /// 到 ZCode 自身 ~30s 轮询）。所以重启时优先用同一份快捷方式的 target + arguments 拉起。
+///
+/// 自愈：ZCode 更新/重装会重建快捷方式并抹掉 flag（实测 Win11 上发生过）。只要用户开过
+/// 增强启动（launcher 备份非空），重启时先重写快捷方式，并在命令行上兜底补 flag，
+/// 保证重启出来的 ZCode 一定带着 CDP 端口。
 #[tauri::command]
 pub fn restart_zcode() -> R<()> {
     #[cfg(target_os = "macos")]
@@ -112,20 +118,43 @@ pub fn restart_zcode() -> R<()> {
             )
         })?;
 
-        // 3. kill 全部同名进程
-        kill_all_zcode();
-        thread::sleep(Duration::from_millis(800));
+        // 2.5 增强启动自愈：备份非空说明用户开过；快捷方式丢了 flag 就重写一遍。
+        let opted_in = crate::zcode_launcher::user_opted_into_remote_debug();
+        let flag_missing = preferred
+            .as_ref()
+            .map(|sc| !has_remote_debug_flag(&sc.arguments))
+            .unwrap_or(true);
+        if opted_in && flag_missing {
+            // 尽力重写 .lnk（用户目录的成功率高；Public/ProgramData 无管理员权限会失败，
+            // 由下面命令行兜底补 flag 覆盖这种情况）。
+            let _ = crate::zcode_launcher::enable_remote_debug();
+        }
+
+        // 3. kill 全部同名进程并等真正退出
+        kill_all_zcode_and_wait()?;
 
         // 4. 重启：有快捷方式就用它的 target + args；否则回落到 exe 直拉。
+        //    用户开过增强启动但快捷方式仍缺 flag 时，命令行兜底补上。
         if let Some(sc) = preferred {
             let target = if sc.target.trim().is_empty() {
                 exe_path.clone()
             } else {
                 sc.target.clone()
             };
-            return spawn_zcode_with_args(&target, &sc.arguments);
+            let mut args = sc.arguments;
+            if opted_in && !has_remote_debug_flag(&args) {
+                args = append_debug_flag(&args, crate::zcode_launcher::REMOTE_DEBUGGING_FLAG);
+            }
+            spawn_zcode_with_args(&target, &args)?;
+        } else {
+            let mut args = String::new();
+            if opted_in {
+                args = append_debug_flag(&args, crate::zcode_launcher::REMOTE_DEBUGGING_FLAG);
+            }
+            spawn_zcode_with_args(&exe_path, &args)?;
         }
-        spawn_zcode(&exe_path)
+        // 5. 确认真起来了：旧实例锁未释放等情况下新进程会静默退出，这里必须报错。
+        verify_zcode_started()
     }
 }
 
@@ -351,10 +380,81 @@ fn kill_all_zcode() {
     }
 }
 
-/// 用给定路径拉起 ZCode（独立进程，不阻塞）。
+/// 判断字符串参数里是否已经带了 remote-debugging flag（按空白分词精确匹配）。
 #[cfg(not(target_os = "macos"))]
-fn spawn_zcode(exe_path: &str) -> R<()> {
-    spawn_zcode_with_args(exe_path, "")
+fn has_remote_debug_flag(args: &str) -> bool {
+    args.split_whitespace()
+        .any(|tok| tok.eq_ignore_ascii_case(crate::zcode_launcher::REMOTE_DEBUGGING_FLAG))
+}
+
+/// 在参数串末尾追加 flag（空的参数串直接等于 flag）。
+#[cfg(not(target_os = "macos"))]
+fn append_debug_flag(args: &str, flag: &str) -> String {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        flag.to_string()
+    } else {
+        format!("{} {}", trimmed, flag)
+    }
+}
+
+/// count_zcode_processes：等待与验证共用。
+fn count_zcode_processes() -> usize {
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::new());
+    sys.processes()
+        .iter()
+        .filter(|(_, p)| is_zcode_process_name(&p.name().to_string_lossy()))
+        .count()
+}
+
+/// kill 全部 ZCode 进程并**轮询等待真正退出**，期间补杀残留/重生的进程。
+///
+/// 为什么不能固定 sleep：Electron 是 1 主进程 + 多辅助进程，满载时强杀后 ~1s+ 才退干净
+/// （Win11 ARM 虚机实测 958ms > 旧实现的 800ms）。提前 spawn 会撞上 Electron 的
+/// requestSingleInstanceLock——新实例把参数转发给正在退出的旧实例后自己退出，表现为
+/// "重启了但什么都没发生"，用户只能再点一次。
+fn kill_all_zcode_and_wait() -> R<()> {
+    kill_all_zcode();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let remaining = count_zcode_processes();
+        if remaining == 0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(AppError::Msg(format!(
+                "ZCode 有 {} 个进程未能退出，请手动关闭 ZCode 后重试。",
+                remaining
+            )));
+        }
+        thread::sleep(Duration::from_millis(150));
+        // 补杀残留（如个别辅助进程未随主进程退出）
+        kill_all_zcode();
+    }
+}
+
+/// spawn 之后轮询确认 ZCode 进程真的起来了，且连续两次采样都还在（避免撞单实例锁
+/// 转发后退出的"闪启"被判成成功）。起不来就报错，让前端给出明确失败提示。
+#[cfg(not(target_os = "macos"))]
+fn verify_zcode_started() -> R<()> {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if count_zcode_processes() > 0 {
+            // 再观察 500ms 确认不是闪启（单实例锁转发会立刻退出）
+            thread::sleep(Duration::from_millis(500));
+            if count_zcode_processes() > 0 {
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(AppError::Msg(
+                "ZCode 启动失败：进程未能保持运行（可能被安全软件拦截或单实例冲突），请手动打开。"
+                    .into(),
+            ));
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// 用 target + 命令行字符串拉起 ZCode（保留 --remote-debugging-port=9229 等参数）。

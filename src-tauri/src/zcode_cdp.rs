@@ -137,14 +137,18 @@ async fn pick_zcode_page() -> Option<String> {
     let url = format!("http://127.0.0.1:{}/json/list", CDP_PORT);
     let resp = client.get(&url).send().await.ok()?;
     let targets: Vec<CdpTarget> = resp.json().await.ok()?;
+    // 主判断用 URL：renderer/index.html 是 ZCode 自己的页面（devtools 等其它 target
+    // 不会带这个路径）。title 只做兜底且用包含匹配——不同版本/本地化下窗口标题
+    // 不一定恰好叫 "ZCode"，之前的 == 精确匹配会漏掉页面导致无感刷新静默失效。
     targets
-        .into_iter()
-        .find(|t| {
-            t.target_type == "page"
-                && t.title == "ZCode"
-                && t.url.contains("renderer/index.html")
+        .iter()
+        .find(|t| t.target_type == "page" && t.url.contains("renderer/index.html"))
+        .or_else(|| {
+            targets
+                .iter()
+                .find(|t| t.target_type == "page" && t.title.to_lowercase().contains("zcode"))
         })
-        .map(|t| t.ws_url)
+        .map(|t| t.ws_url.clone())
 }
 
 async fn evaluate(ws_url: &str, expression: &str) -> Result<String, String> {

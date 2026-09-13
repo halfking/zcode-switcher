@@ -9,6 +9,7 @@ mod proxy;
 mod proxy_pool;
 mod quota;
 mod restart;
+mod tray;
 mod zcode_cdp;
 mod zcode_launcher;
 
@@ -366,6 +367,18 @@ pub fn run() {
                 for url in urls {
                     oauth::handle_deep_link_url(url.as_str());
                 }
+            }
+            // 点 X（或应用内关闭按钮、Cmd+Q/Alt+F4）不退出：隐藏到托盘驻留后台。
+            // 托盘菜单「Show / Quit」由 tray::setup_tray 构建。
+            tray::setup_tray(app.handle())?;
+            if let Some(window) = app.get_webview_window("main") {
+                let win = window.clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = win.hide();
+                    }
+                });
             }
             Ok(())
         })
