@@ -219,6 +219,16 @@ pub struct ProfileView {
     pub short_id: String,
 }
 
+/// IPC 边界脱敏：前端（ProfileView TS 类型）从不消费 provider_api_keys 的值，
+/// 返回给 webview 的 Profile 一律清空 key 值，缩小注入/自动化读取明文密钥的面。
+/// 磁盘索引（save_index）仍保存完整值，切换等内部逻辑读的是磁盘，不受影响。
+fn redact_provider_keys(mut p: Profile) -> Profile {
+    for value in p.provider_api_keys.values_mut() {
+        value.clear();
+    }
+    p
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PortableAccount {
     pub schema: String,
@@ -616,16 +626,23 @@ fn profile_identity_key(profile: &Profile) -> Option<String> {
 }
 
 /// 原子写入：先写 .tmp 再 rename，避免写一半导致文件损坏。
+/// 失败时清理 .tmp，避免残留半截（凭据类文件残留即明文泄漏面）。
 fn atomic_write(path: &Path, data: &[u8]) -> R<()> {
     let mut tmp = path.to_path_buf();
     tmp.set_extension("tmp");
-    {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(data)?;
-        f.sync_all()?;
+    let result = (|| -> R<()> {
+        {
+            let mut f = fs::File::create(&tmp)?;
+            f.write_all(data)?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    fs::rename(&tmp, path)?;
-    Ok(())
+    result
 }
 
 /// 原地 truncate + 写入新内容，**不**用 tmp+rename。
@@ -774,7 +791,7 @@ fn update_profile_from_capture(
     metadata: &AccountMetadata,
 ) -> R<Profile> {
     if !profile.cred_file.is_empty() {
-        fs::write(profiles_dir()?.join(&profile.cred_file), cred_bytes)?;
+        atomic_write(&profiles_dir()?.join(&profile.cred_file), cred_bytes)?;
     }
     profile.name = final_name;
     profile.user_id = user_id;
@@ -1079,7 +1096,7 @@ pub fn list_profiles() -> R<Vec<ProfileView>> {
                 .unwrap_or(false);
             let short_id = short_id(&p.user_id);
             ProfileView {
-                profile: p,
+                profile: redact_provider_keys(p),
                 active,
                 short_id,
             }
@@ -1182,7 +1199,7 @@ pub fn capture_current(name: String) -> R<Profile> {
         let live_hash = current_cred_hash();
         dedup_before_save(&mut profiles, live_hash.as_deref());
         save_index(&profiles)?;
-        return Ok(saved);
+        return Ok(redact_provider_keys(saved));
     }
 
     // 新建：内部 id 使用唯一身份 hash，避免依赖不稳定身份字段。
@@ -1190,7 +1207,7 @@ pub fn capture_current(name: String) -> R<Profile> {
     let cred_file_name = format!("credentials.{}.json", id);
     let dir = profiles_dir()?;
     fs::create_dir_all(&dir)?;
-    fs::write(dir.join(&cred_file_name), &cred_bytes)?;
+    atomic_write(&dir.join(&cred_file_name), &cred_bytes)?;
 
     let profile = Profile {
         id: id.clone(),
@@ -1211,7 +1228,7 @@ pub fn capture_current(name: String) -> R<Profile> {
     let live_hash = current_cred_hash();
     dedup_before_save(&mut profiles, live_hash.as_deref());
     save_index(&profiles)?;
-    Ok(profile)
+    Ok(redact_provider_keys(profile))
 }
 
 /// 切换到指定档案：备份当前 → 写入目标凭据（原子写）。
@@ -1303,7 +1320,7 @@ pub fn switch_to(id: String) -> R<Profile> {
     let live_hash = current_cred_hash();
     dedup_before_save(&mut profiles, live_hash.as_deref());
     save_index(&profiles)?;
-    Ok(profile)
+    Ok(redact_provider_keys(profile))
 }
 
 /// 重命名档案。
@@ -1409,7 +1426,7 @@ pub fn import_profile_json(json_text: String) -> R<Profile> {
     if portable.schema != "zcode-switcher-account/v1" {
         return Err(AppError::Msg("不支持的账号 JSON 格式".into()));
     }
-    import_portable_account(portable)
+    Ok(redact_provider_keys(import_portable_account(portable)?))
 }
 
 fn import_portable_account(portable: PortableAccount) -> R<Profile> {
@@ -1509,10 +1526,10 @@ fn import_portable_account(portable: PortableAccount) -> R<Profile> {
                 let cred_file_name = format!("credentials.{}.json", existing.id);
                 let dir = profiles_dir()?;
                 fs::create_dir_all(&dir)?;
-                fs::write(dir.join(&cred_file_name), &cred_bytes)?;
+                atomic_write(&dir.join(&cred_file_name), &cred_bytes)?;
                 existing.cred_file = cred_file_name;
             } else {
-                fs::write(profiles_dir()?.join(&existing.cred_file), &cred_bytes)?;
+                atomic_write(&profiles_dir()?.join(&existing.cred_file), &cred_bytes)?;
             }
             existing.cred_hash = cred_hash.clone();
             if existing.email.is_empty() {
@@ -1548,7 +1565,7 @@ fn import_portable_account(portable: PortableAccount) -> R<Profile> {
     let cred_file_name = format!("credentials.{}.json", id);
     let dir = profiles_dir()?;
     fs::create_dir_all(&dir)?;
-    fs::write(dir.join(&cred_file_name), &cred_bytes)?;
+    atomic_write(&dir.join(&cred_file_name), &cred_bytes)?;
 
     let profile = Profile {
         id: id.clone(),
@@ -1569,7 +1586,7 @@ fn import_portable_account(portable: PortableAccount) -> R<Profile> {
     let live_hash = current_cred_hash();
     dedup_before_save(&mut profiles, live_hash.as_deref());
     save_index(&profiles)?;
-    Ok(profile)
+    Ok(redact_provider_keys(profile))
 }
 
 #[tauri::command]
@@ -1601,24 +1618,37 @@ pub fn export_profiles_to_file(ids: Vec<String>, path: String) -> R<()> {
 
 /// 把账号列表写成 zip（每个账号一个 JSON 文件）。
 fn write_profiles_zip(profiles: Vec<Profile>, path: String) -> R<()> {
-    let file = fs::File::create(path)?;
-    let mut zip = ZipWriter::new(file);
-    let options = FileOptions::default().compression_method(CompressionMethod::Deflated);
-    for (index, profile) in profiles.into_iter().enumerate() {
-        let fallback = if !profile.user_id.is_empty() {
-            profile.user_id.chars().take(12).collect::<String>()
-        } else if !profile.id.is_empty() {
-            profile.id.chars().take(12).collect::<String>()
-        } else {
-            profile.cred_hash.chars().take(12).collect::<String>()
-        };
-        let file_name = safe_export_file_name(&profile.name, &fallback, index);
-        let account = portable_account_from_profile(profile)?;
-        let json = serde_json::to_string_pretty(&account)?;
-        zip.start_file(file_name, options).map_err(err)?;
-        zip.write_all(json.as_bytes())?;
+    // 导出内容是明文凭据：先写同目录 .tmp，成功后 rename 覆盖目标；
+    // 中途失败删除 .tmp，避免目标路径残留截断/部分明文的包。
+    let dest = PathBuf::from(&path);
+    let mut tmp = dest.clone();
+    tmp.as_mut_os_string().push(".tmp");
+    let result = (|| -> R<()> {
+        let file = fs::File::create(&tmp)?;
+        let mut zip = ZipWriter::new(file);
+        let options = FileOptions::default().compression_method(CompressionMethod::Deflated);
+        for (index, profile) in profiles.into_iter().enumerate() {
+            let fallback = if !profile.user_id.is_empty() {
+                profile.user_id.chars().take(12).collect::<String>()
+            } else if !profile.id.is_empty() {
+                profile.id.chars().take(12).collect::<String>()
+            } else {
+                profile.cred_hash.chars().take(12).collect::<String>()
+            };
+            let file_name = safe_export_file_name(&profile.name, &fallback, index);
+            let account = portable_account_from_profile(profile)?;
+            let json = serde_json::to_string_pretty(&account)?;
+            zip.start_file(file_name, options).map_err(err)?;
+            zip.write_all(json.as_bytes())?;
+        }
+        zip.finish().map_err(err)?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
-    zip.finish().map_err(err)?;
+    fs::rename(&tmp, dest)?;
     Ok(())
 }
 
@@ -1763,13 +1793,15 @@ pub fn import_profiles_from_files(paths: Vec<String>) -> R<BatchImportReport> {
 #[tauri::command]
 pub fn export_profile_to_file(id: String, path: String) -> R<()> {
     let json = export_profile_json(id)?;
-    fs::write(path, json.as_bytes())?;
+    // 导出文件内容是明文凭据：原子写避免中途失败在目标路径残留半截明文。
+    atomic_write(Path::new(&path), json.as_bytes())?;
     Ok(())
 }
 
 #[tauri::command]
 pub fn import_profile_from_file(path: String) -> R<Profile> {
     let json = fs::read_to_string(path)?;
+    // import_profile_json 内部已完成 IPC 脱敏。
     import_profile_json(json)
 }
 
@@ -1900,6 +1932,74 @@ mod tests {
     fn portable_credentials_reject_non_object_input() {
         assert!(encrypt_portable_credentials(serde_json::json!(["x"])).is_err());
         assert!(decrypt_portable_credentials(serde_json::json!("str")).is_err());
+    }
+
+    #[test]
+    fn redact_provider_keys_clears_values_keeps_other_fields() {
+        let profile = Profile {
+            id: "abc123".into(),
+            name: "tester".into(),
+            user_id: "u-1".into(),
+            email: "t@example.com".into(),
+            phone: String::new(),
+            avatar: String::new(),
+            cred_hash: "hash".into(),
+            cred_file: "credentials.abc123.json".into(),
+            created_at: 1.0,
+            updated_at: 2.0,
+            family: "bigmodel".into(),
+            mode: "oauth".into(),
+            provider_api_keys: [
+                ("builtin:bigmodel".to_string(), "sk-secret".to_string()),
+                (
+                    "builtin:bigmodel-start-plan".to_string(),
+                    "jwt-secret".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let redacted = redact_provider_keys(profile.clone());
+        assert!(
+            redacted.provider_api_keys.values().all(|v| v.is_empty()),
+            "IPC 返回的 key 值必须全为空"
+        );
+        assert_eq!(
+            redacted.provider_api_keys.len(),
+            profile.provider_api_keys.len(),
+            "键名集合保留，前端/诊断仍能判断哪些入口有 key"
+        );
+        assert_eq!(redacted.name, profile.name);
+        assert_eq!(redacted.cred_file, profile.cred_file);
+        // 原对象不受影响（磁盘索引仍保存完整值）。
+        assert!(profile.provider_api_keys.values().all(|v| !v.is_empty()));
+    }
+
+    #[test]
+    fn atomic_write_roundtrip_replaces_and_leaves_no_tmp() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("zcs-atomic-test-{}.json", std::process::id()));
+        let _ = fs::remove_file(&path);
+        atomic_write(&path, b"first").expect("first write");
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        atomic_write(&path, b"second").expect("replace write");
+        assert_eq!(fs::read(&path).unwrap(), b"second");
+
+        let mut tmp = path.clone();
+        tmp.set_extension("tmp");
+        assert!(!path.with_extension("tmp").exists());
+        assert!(!tmp.exists());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn atomic_write_cleans_tmp_when_target_dir_missing() {
+        let dir = std::env::temp_dir().join(format!("zcs-atomic-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("out.json");
+        assert!(atomic_write(&path, b"data").is_err());
+        assert!(!path.exists());
+        assert!(!dir.exists(), "失败的写入不应在目标目录残留 .tmp");
     }
 
     #[test]

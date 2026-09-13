@@ -191,16 +191,24 @@ if (Test-Path $profilesPath) {
 }
 
 # ---- 5. ZCode CDP（9229） ------------------------------------------------------
-try {
-    $list = Invoke-RestMethod -Uri ("http://127.0.0.1:{0}/json/list" -f $CdpPort) -TimeoutSec 5
-    $page = @($list) | Where-Object { $_.type -eq 'page' -and $_.url -like '*renderer/index.html*' } | Select-Object -First 1
-    if ($page) {
-        Write-Pass 'zcode.cdp' ("port={0} renderer page present" -f $CdpPort)
-    } else {
-        Write-Fail 'zcode.cdp' ("port={0} reachable but no renderer/index.html page" -f $CdpPort)
+# /json/list 偶发瞬时不稳定（进程忙时可能短暂返回空列表），最多重试 3 次。
+$cdpPage = $null
+$cdpLastError = ''
+foreach ($attempt in 1..3) {
+    try {
+        $list = Invoke-RestMethod -Uri ("http://127.0.0.1:{0}/json/list" -f $CdpPort) -TimeoutSec 5
+        $cdpPage = @($list) | Where-Object { $_.type -eq 'page' -and $_.url -like '*renderer/index.html*' } | Select-Object -First 1
+        if ($cdpPage) { break }
+        $cdpLastError = 'no renderer/index.html page'
+    } catch {
+        $cdpLastError = $_.Exception.Message
     }
-} catch {
-    Write-Fail 'zcode.cdp' ("port={0} not reachable: {1}" -f $CdpPort, $_.Exception.Message)
+    Start-Sleep -Seconds 2
+}
+if ($cdpPage) {
+    Write-Pass 'zcode.cdp' ("port={0} renderer page present" -f $CdpPort)
+} else {
+    Write-Fail 'zcode.cdp' ("port={0}: {1}" -f $CdpPort, $cdpLastError)
 }
 
 # ---- 汇总 ----------------------------------------------------------------------

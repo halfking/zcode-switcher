@@ -54,21 +54,33 @@
 
 ### 2.2 原子写入与回滚
 
-- **导出（建议立刻做，成本极低）**：`write_profiles_zip` 与 `export_profile_to_file`
-  改为写 `同目录/<name>.tmp` → `fs::rename` 覆盖目标。仓库里已有现成
-  `atomic_write`（`profile.rs:619`），抽为公共函数复用即可。失败时清理 .tmp，不残留明文。
-- **导入（建议做"预校验 + 有序提交"）**：
+- **导出（✅ 已实现，2026-09-14）**：`write_profiles_zip` 与 `export_profile_to_file`
+  已改为写 `同目录/<name>.tmp` → `fs::rename` 覆盖目标；失败时删除 .tmp，
+  目标路径不会残留截断/部分明文。`atomic_write` 本身也补了失败清理。
+- **凭据快照（✅ 已实现，2026-09-14）**：档案库 5 处凭据副本写入全部改为 `atomic_write`，
+  崩溃不再可能出现"索引指向半截快照"的悬空引用。
+  （ZCode 自身 config.json/setting.json 保持 `write_in_place`，是为 fs.watch 语义的有意取舍，不动。）
+- **IPC 脱敏（✅ 已实现，2026-09-14）**：审计发现 `list_profiles`/`capture_current`/`switch_to`/
+  `import_profile_json` 返回给 webview 的 Profile 经 `#[serde(flatten)]` 携带明文
+  `provider_api_keys`（前端 TS 类型并不消费这些值）。现已在全部 IPC 返回点用
+  `redact_provider_keys` 清空 key 值；磁盘索引与切换内部逻辑仍用完整值，不受影响。
+- **导入（建议做"预校验 + 有序提交"，未实现）**：
   1. 先把所有输入全部解析、解密、校验（schema、身份字段、enc:v1 拒绝）到内存；
-  2. 全部通过后逐个提交，顺序固定为"写凭据副本 → 原子更新索引"；
+  2. 全部通过后逐个提交，顺序固定为"写凭据副本 → 原子更新索引"（现顺序已正确，快照写入已原子化）；
   3. 任一账号在**校验阶段**失败则整批拒绝（一个都没写），**提交阶段**失败则停止并在报告中
      标明已完成数量（此时不做删除式回滚——回滚本身可能误删同名既有档案，风险大于收益）。
 - **不推荐做删除式整批回滚**：导入可能更新既有档案（同身份去重），回滚意味着恢复旧内容，
   需要备份/恢复整套机制，复杂度与出错面都大；"预校验"已消除绝大多数中途失败。
+- **密码加密导出（未实现，仍是首选下一步）**：见 2.1 节 schema v2 方案。
 
-## 3. 已补充的回归覆盖（2026-09-13）
+## 3. 已补充的回归覆盖
 
-- `profile.rs` tests：portable 凭据"明文→加密→解密"往返、`enc:v1:` 双重加密输入拒绝、
-  非 object 输入拒绝（跨平台，Windows 实机可跑 `cargo test --lib profile::tests`）。
+- `profile.rs` tests（2026-09-13，35 passed）：portable 凭据"明文→加密→解密"往返、
+  `enc:v1:` 双重加密输入拒绝、非 object 输入拒绝、IPC 脱敏行为、
+  atomic_write 往返替换/无 .tmp 残留/失败清理（跨平台，Windows 实机可跑
+  `cargo test --lib profile::tests`）。
 - `scripts/windows-regression.ps1`（`npm run test:windows`）：真实用户桌面会话下的实机检查——
   已安装 Switcher 版本、Switcher/ZCode 进程归属交互会话、`credentials.json` 与账号池快照
-  全部为 `enc:v1:` 密文、ZCode CDP 9229 渲染页面存在。脚本只输出计数/路径/掩码邮箱，不输出任何 token。
+  全部为 `enc:v1:` 密文、ZCode CDP 9229 渲染页面存在（带 3 次重试，规避瞬时抖动）。
+  脚本只输出计数/路径/掩码邮箱，不输出任何 token。
+  2026-09-13 已在 Parallels Windows 11 真实 xutaohuang 桌面会话实机验证 10/10 PASS。
