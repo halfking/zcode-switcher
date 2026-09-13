@@ -1860,6 +1860,49 @@ mod tests {
     }
 
     #[test]
+    fn portable_credentials_roundtrip_reencrypts_only_strings() {
+        let plain = serde_json::json!({
+            "oauth:active_provider": "bigmodel",
+            "tokens": "{\"access\":\"plain-secret\"}",
+            "nested": { "child": "value" },
+            "count": 3,
+            "flag": true,
+            "empty": ""
+        });
+
+        let encrypted = encrypt_portable_credentials(plain.clone()).expect("encrypt portable");
+        let stored: Value = serde_json::from_slice(&encrypted).expect("encrypted json");
+
+        for key in ["oauth:active_provider", "tokens"] {
+            let value = stored[key].as_str().expect("string field");
+            assert!(
+                crate::crypto::is_encrypted(value),
+                "{key} 应为 enc:v1: 密文"
+            );
+        }
+        assert_eq!(stored["count"], serde_json::json!(3));
+        assert_eq!(stored["flag"], serde_json::json!(true));
+        assert_eq!(stored["nested"]["child"], serde_json::json!("value"));
+
+        let decrypted = decrypt_portable_credentials(stored).expect("decrypt portable");
+        assert_eq!(decrypted, plain, "往返后应还原为明文结构");
+    }
+
+    #[test]
+    fn portable_encrypt_rejects_already_encrypted_input() {
+        let cipher = crate::crypto::encrypt("plain-secret").expect("encrypt");
+        let bad = serde_json::json!({ "tokens": cipher });
+        let err = encrypt_portable_credentials(bad).expect_err("enc:v1: 输入必须被拒绝");
+        assert!(format!("{err}").contains("enc:v1:"));
+    }
+
+    #[test]
+    fn portable_credentials_reject_non_object_input() {
+        assert!(encrypt_portable_credentials(serde_json::json!(["x"])).is_err());
+        assert!(decrypt_portable_credentials(serde_json::json!("str")).is_err());
+    }
+
+    #[test]
     fn identify_save_restore_local_zcode() {
         let status = current_status().expect("current_status");
         assert!(status.logged_in, "local ZCode credentials.json missing");

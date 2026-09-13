@@ -11,7 +11,8 @@
     "notice:preview": "node scripts/preview-notice.mjs",
     "notice:check": "node scripts/preview-notice.mjs --check",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-regression.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
