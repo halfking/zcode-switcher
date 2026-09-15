@@ -31,3 +31,4 @@ refresh-desktop-icon-cache.bat
 *.sln
 *.sw?
 .zcode/
+.tools/
