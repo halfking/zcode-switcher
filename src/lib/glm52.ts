@@ -15,6 +15,27 @@ export function monitoredBalances(quota?: QuotaInfo): BalanceItem[] {
   return quota?.balances?.filter(isMonitoredBalance) ?? [];
 }
 
+/**
+ * 判断额度条目是否属于 ZCode 当前选中的供应者（用于"使用中"标记）。
+ *
+ * active_provider 形如 "coding-plan:builtin:bigmodel-start-plan"：
+ * - 积分条目（unit_type=point，个人套餐）→ 命中 coding-plan 供应者；
+ * - token 条目按 show_name 的套餐短名前缀匹配（Start·/Coding·）。
+ * Global Build 等桌面端无对应供应者的套餐不参与标记。
+ */
+export function isBalanceActive(
+  item: BalanceItem,
+  activeProvider?: string | null
+): boolean {
+  if (!activeProvider) return false;
+  const provider = activeProvider.toLowerCase();
+  if (item.unit_type === "point") return provider.includes("coding-plan");
+  const name = item.show_name.trim().toLowerCase();
+  if (name.startsWith("start·")) return provider.includes("start-plan");
+  if (name.startsWith("coding·")) return provider.includes("coding-plan");
+  return false;
+}
+
 function balanceRemaining(item: BalanceItem): number {
   if (Number.isFinite(item.remaining_units)) return Math.max(0, item.remaining_units);
   const total = Number.isFinite(item.total_units) ? Math.max(0, item.total_units) : 0;

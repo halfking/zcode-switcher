@@ -362,6 +362,10 @@ fn quota_probe_cli() -> i32 {
             println!("刷新结果: 成功");
             println!("套餐: {:?}", info.plan_name);
             println!("状态: {:?}", info.plan_status);
+            println!(
+                "当前供应者: {}",
+                info.active_provider.as_deref().unwrap_or("(未知)")
+            );
             println!("额度条目 ({}):", info.balances.len());
             for item in &info.balances {
                 let tag = match (item.period.as_deref(), item.unit_type.as_deref()) {
@@ -370,7 +374,7 @@ fn quota_probe_cli() -> i32 {
                     _ => "-".to_string(),
                 };
                 println!(
-                    "  - {:<16} 剩余 {:>10.0} / {:>10.0} ({})",
+                    "  - {:<22} 剩余 {:>10.0} / {:>10.0} ({})",
                     item.show_name,
                     item.remaining_units,
                     item.total_units,

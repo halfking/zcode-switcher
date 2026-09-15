@@ -38,6 +38,12 @@ pub struct QuotaInfo {
     /// 套餐到期时间（Unix 秒，0 表示无）
     pub plan_ends_at: Option<f64>,
     pub balances: Vec<BalanceItem>,
+    /// ZCode 当前选中的模型供应者（setting.json 的
+    /// modelProviderFamilySelectedKeys.bigmodel，如
+    /// "coding-plan:builtin:bigmodel-start-plan"）。前端据此标记
+    /// "使用中" 的套餐条目；None 表示读不到（非当前登录账号等）。
+    #[serde(default)]
+    pub active_provider: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -52,6 +58,8 @@ struct ApiEnvelope<T> {
 struct PlanInfo {
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    plan_id: Option<String>,
     #[serde(default)]
     description: Option<String>,
     #[serde(default)]
@@ -129,10 +137,26 @@ pub async fn fetch_quota(creds_text: &str) -> Result<QuotaInfo, String> {
 
     let (plan_parts, mut balances) = match balance {
         Some(balance) => {
+            // plan_id → 套餐名映射：同名模型条目可能来自多个同时生效的套餐
+            // （如 Global Build 与 Start Plan 各有一个 GLM-5.3-Flash 桶），
+            // 用套餐短名前缀区分。
+            let plan_names: std::collections::HashMap<String, String> = balance
+                .plans
+                .iter()
+                .filter_map(|p| {
+                    let id = p.plan_id.as_deref()?.to_string();
+                    let name = p.name.clone().unwrap_or_default();
+                    if name.is_empty() {
+                        None
+                    } else {
+                        Some((id, name))
+                    }
+                })
+                .collect();
             let balances: Vec<BalanceItem> = balance
                 .balances
                 .into_iter()
-                .filter_map(parse_balance_item)
+                .filter_map(|v| parse_balance_item(v, &plan_names))
                 .collect();
             (Some(pick_best_plan(balance.plans)), balances)
         }
@@ -163,7 +187,49 @@ pub async fn fetch_quota(creds_text: &str) -> Result<QuotaInfo, String> {
         plan_status,
         plan_ends_at,
         balances,
+        active_provider: read_active_bigmodel_provider(),
     })
+}
+
+/// 读取 ZCode setting.json 里 bigmodel 家族当前选中的供应者
+/// （modelProviderFamilySelectedKeys.bigmodel，如
+/// "coding-plan:builtin:bigmodel-start-plan"）。
+/// 这是"当前在用哪个套餐"的权威数据，与桌面端模型切换保持同源。
+fn read_active_bigmodel_provider() -> Option<String> {
+    let path = crate::profile::zcode_settings_dir().ok()?.join("setting.json");
+    let text = fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    let selected = value
+        .get("modelProviderFamilySelectedKeys")?
+        .get("bigmodel")?
+        .as_str()?
+        .trim()
+        .to_string();
+    if selected.is_empty() {
+        None
+    } else {
+        Some(selected)
+    }
+}
+
+/// 套餐短名：完整套餐名太长（"ZCode Global Build"），额度条目里用短前缀。
+fn plan_short_name(plan_name: &str) -> String {
+    let lower = plan_name.to_ascii_lowercase();
+    if lower.contains("start") {
+        "Start".into()
+    } else if lower.contains("global") {
+        "Global".into()
+    } else if lower.contains("coding") {
+        "Coding".into()
+    } else if lower.contains("team") {
+        "Team".into()
+    } else {
+        plan_name
+            .split_whitespace()
+            .next()
+            .unwrap_or(plan_name)
+            .to_string()
+    }
 }
 
 /// Coding Plan（个人套餐，积分制）的额度快照：一组按窗口重置的积分桶。
@@ -445,12 +511,26 @@ fn string_field(value: &Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn parse_balance_item(value: Value) -> Option<BalanceItem> {
+fn parse_balance_item(
+    value: Value,
+    plan_names: &std::collections::HashMap<String, String>,
+) -> Option<BalanceItem> {
     let mut item = serde_json::from_value::<BalanceItem>(value.clone()).ok()?;
     if item.show_name.trim().is_empty() {
         item.show_name = string_field(&value, "name")
             .or_else(|| string_field(&value, "entitlement_id"))
             .unwrap_or_else(|| "额度".into());
+    }
+    // 多套餐同时生效时同名模型会出现多个桶（如 Global·GLM-5.3-Flash 与
+    // Start·GLM-5.3-Flash），用套餐短名前缀区分；个人套餐积分条目
+    // （mcp/usage 来的）没有 plan_id，保持原样。
+    if let Some(plan_id) = value.get("plan_id").and_then(Value::as_str) {
+        if let Some(plan_name) = plan_names.get(plan_id) {
+            let short = plan_short_name(plan_name);
+            if !item.show_name.starts_with(&format!("{short}·")) {
+                item.show_name = format!("{}·{}", short, item.show_name);
+            }
+        }
     }
     if number_field(&value, "remaining_units").is_none() {
         item.remaining_units = number_field(&value, "available_units")
@@ -759,7 +839,7 @@ mod tests {
         let balances: Vec<_> = data
             .balances
             .into_iter()
-            .filter_map(parse_balance_item)
+            .filter_map(|v| parse_balance_item(v, &std::collections::HashMap::new()))
             .collect();
         assert_eq!(name.as_deref(), Some("ZCode Start Plan"));
         assert_eq!(status.as_deref(), Some("active"));
@@ -767,6 +847,65 @@ mod tests {
         assert_eq!(balances.len(), 2);
         assert_eq!(balances[0].show_name, "GLM-5.3");
         assert_eq!(balances[0].remaining_units, 2_900_000.0);
+    }
+
+    #[test]
+    fn balance_items_get_plan_prefix_from_plan_id() {
+        // 多套餐同时生效：同名模型条目（GLM-5.3-Flash）各带套餐短名前缀区分。
+        let data: BillingBalanceData = serde_json::from_value(json!({
+            "plans": [
+                {"plan_id": "zcode-v3-global-build", "name": "ZCode Global Build", "priority": 200},
+                {"plan_id": "zcode-v3-start-plan-0817", "name": "ZCode Start Plan", "priority": 90}
+            ],
+            "balances": [
+                {"plan_id": "zcode-v3-global-build", "show_name": "GLM-5.3-Flash",
+                 "total_units": 100000000, "used_units": 0, "remaining_units": 100000000},
+                {"plan_id": "zcode-v3-start-plan-0817", "show_name": "GLM-5.3-Flash",
+                 "total_units": 5000000, "used_units": 5000000, "remaining_units": 0}
+            ]
+        }))
+        .unwrap();
+        let plan_names: std::collections::HashMap<String, String> = data
+            .plans
+            .iter()
+            .filter_map(|p| {
+                p.plan_id
+                    .clone()
+                    .zip(p.name.clone())
+                    .map(|(id, name)| (id, name))
+            })
+            .collect();
+        let balances: Vec<_> = data
+            .balances
+            .into_iter()
+            .filter_map(|v| parse_balance_item(v, &plan_names))
+            .collect();
+        assert_eq!(balances.len(), 2);
+        assert_eq!(balances[0].show_name, "Global·GLM-5.3-Flash");
+        assert_eq!(balances[1].show_name, "Start·GLM-5.3-Flash");
+        // 两个套餐各自的剩余量保留
+        assert_eq!(balances[0].remaining_units, 100_000_000.0);
+        assert_eq!(balances[1].remaining_units, 0.0);
+    }
+
+    #[test]
+    fn plan_short_name_maps_known_plans() {
+        assert_eq!(plan_short_name("ZCode Start Plan"), "Start");
+        assert_eq!(plan_short_name("ZCode Global Build"), "Global");
+        assert_eq!(plan_short_name("GLM Coding Plan"), "Coding");
+        assert_eq!(plan_short_name("Team Enterprise"), "Team");
+        // 未知套餐取第一个词
+        assert_eq!(plan_short_name("Foo Bar Plan"), "Foo");
+    }
+
+    #[test]
+    fn read_active_bigmodel_provider_parses_selection() {
+        // 只验证解析逻辑走通：本机 setting.json 可能存在也可能不存在，
+        // 存在时必须是合法字符串或 None，不允许 panic。
+        let selected = read_active_bigmodel_provider();
+        if let Some(value) = selected {
+            assert!(!value.is_empty());
+        }
     }
 
     #[test]
@@ -804,7 +943,7 @@ mod tests {
         let balances: Vec<_> = data
             .balances
             .into_iter()
-            .filter_map(parse_balance_item)
+            .filter_map(|v| parse_balance_item(v, &std::collections::HashMap::new()))
             .collect();
         assert_eq!(name.as_deref(), Some("ZCode Coding Plan"));
         assert_eq!(balances.len(), 3);

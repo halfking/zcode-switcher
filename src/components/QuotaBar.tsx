@@ -4,6 +4,10 @@ interface Props {
   item: BalanceItem;
   /** 紧凑模式：适配窄卡片，单行显示，不使用固定宽度列。 */
   compact?: boolean;
+  /** 该条目所属套餐是否为 ZCode 当前选中的供应者（显示"使用中"标记）。 */
+  active?: boolean;
+  /** "使用中" 文案（title 提示用），由调用方按语言传入。 */
+  activeLabel?: string;
 }
 
 /** 把数值格式化成易读字符串（万 / 百万 / 亿）。 */
@@ -23,7 +27,7 @@ function colorFor(remainingPct: number): string {
   return "bg-ok";
 }
 
-export function QuotaBar({ item, compact = false }: Props) {
+export function QuotaBar({ item, compact = false, active = false, activeLabel }: Props) {
   const total = item.total_units || 0;
   const used = item.used_units || 0;
   const remaining = item.remaining_units || Math.max(0, total - used);
@@ -32,14 +36,17 @@ export function QuotaBar({ item, compact = false }: Props) {
   const color = colorFor(remainingPct);
   // 积分制套餐（GLM Coding 个人套餐）：单位是积分而非 token，展示时带单位。
   const unit = item.unit_type === "point" ? " 积分" : "";
+  const nameTitle = active && activeLabel ? `${item.show_name}（${activeLabel}）` : item.show_name;
+  // 使用中的条目加左侧绿色边条，与普通条目视觉区分且不挤占窄卡片宽度。
+  const activeRing = active ? "border-l-2 border-ok pl-1" : "";
 
   if (compact) {
     // 紧凑模式：单行，名称弹性截断，进度条细，剩余值在右
     return (
-      <div className="flex min-w-0 items-center gap-1.5">
+      <div className={`flex min-w-0 items-center gap-1.5 ${activeRing}`}>
         <span
           className="w-16 shrink-0 truncate text-[10px] font-medium text-text-muted"
-          title={item.show_name}
+          title={nameTitle}
         >
           {item.show_name}
         </span>
@@ -58,8 +65,8 @@ export function QuotaBar({ item, compact = false }: Props) {
   }
 
   return (
-    <div className="flex items-center gap-3">
-      <span className="w-28 shrink-0 truncate text-[11px] font-medium text-text-secondary" title={item.show_name}>
+    <div className={`flex items-center gap-3 ${activeRing}`}>
+      <span className="w-28 shrink-0 truncate text-[11px] font-medium text-text-secondary" title={nameTitle}>
         {item.show_name}
       </span>
       <div className="relative h-2 flex-1 overflow-hidden rounded-full bg-base-cardhover">

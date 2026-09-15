@@ -12,6 +12,7 @@ import {
 import type { ProfileView, QuotaInfo } from "../lib/api";
 import { gradientFor, initialOf } from "../lib/avatar";
 import { QuotaBar } from "./QuotaBar";
+import { isBalanceActive } from "../lib/glm52";
 import { formatText, getTexts, type Language } from "../i18n";
 
 interface Props {
@@ -231,7 +232,13 @@ function AccountCard({
             ? quota!.balances
                 .slice(0, 2)
                 .map((b, i) => (
-                  <QuotaBar key={`${b.show_name}-${i}`} item={b} compact />
+                  <QuotaBar
+                    key={`${b.show_name}-${i}`}
+                    item={b}
+                    compact
+                    active={isBalanceActive(b, quota?.active_provider)}
+                    activeLabel={t.quotaInUse}
+                  />
                 ))
             : [0, 1].map((i) => (
                 <div key={i} className="flex min-w-0 items-center gap-1.5">
@@ -508,7 +515,12 @@ function AccountCard({
           }`}
         >
           {quota!.balances.slice(0, isListView ? 2 : 4).map((b, i) => (
-            <QuotaBar key={`${b.show_name}-${i}`} item={b} />
+            <QuotaBar
+              key={`${b.show_name}-${i}`}
+              item={b}
+              active={isBalanceActive(b, quota?.active_provider)}
+              activeLabel={t.quotaInUse}
+            />
           ))}
           {showQuotaLoading ? (
             <div className="text-[11px] font-medium text-text-secondary">

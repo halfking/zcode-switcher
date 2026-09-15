@@ -42,6 +42,9 @@ export interface QuotaInfo {
   /** 套餐到期时间（Unix 秒，null 表示无） */
   plan_ends_at: number | null;
   balances: BalanceItem[];
+  /** ZCode 当前选中的模型供应者（如 "coding-plan:builtin:bigmodel-start-plan"），
+   *  用于标记"使用中"的套餐条目；null 表示读不到。 */
+  active_provider?: string | null;
   /** 前端附加：拉取失败时的错误信息 */
   error?: string | null;
   /** 前端附加：拉取时间戳（秒） */
