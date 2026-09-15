@@ -76,11 +76,6 @@ pub async fn fetch_quota(creds_text: &str) -> Result<QuotaInfo, String> {
         serde_json::from_str(creds_text).map_err(|e| format!("解析 credentials 失败：{}", e))?;
     let token =
         crypto::extract_jwt_token(&creds).ok_or_else(|| "无法解出 zcodejwttoken".to_string())?;
-    // Coding Plan（个人套餐）的额度用 BigModel OAuth access token 查询；
-    // 纯 ZCode 凭据没有这个字段，只走 billing/balance。
-    let bigmodel_token = creds["oauth:bigmodel:access_token"]
-        .as_str()
-        .map(str::to_string);
 
     // billing 接口要求 X-Device-Mid（缺失时服务端返回 HTTP 400 code=3001
     // "parameter error"）。ZCode 桌面端把设备标识持久化在 telemetry-state.json，
@@ -108,9 +103,10 @@ pub async fn fetch_quota(creds_text: &str) -> Result<QuotaInfo, String> {
     };
 
     // Coding Plan（个人套餐，积分制）的额度不在 zcode-plan 体系里：
-    // 个人套餐账号调 billing/balance 会返回空 balances，需要单独查 mcp/usage。
-    let coding = match &bigmodel_token {
-        Some(t) => fetch_coding_plan_usage(&client, &token, t).await.ok(),
+    // 个人套餐账号调 billing/balance 拿不到积分，需要用 Coding Plan API Key
+    // 单独查 open.bigmodel.cn 的 quota/limit（与官网控制台同源）。
+    let coding = match read_coding_plan_api_key() {
+        Some(key) => fetch_coding_plan_usage(&client, &key).await.ok(),
         None => None,
     };
 
@@ -125,8 +121,8 @@ pub async fn fetch_quota(creds_text: &str) -> Result<QuotaInfo, String> {
         }
         None => (None, Vec::new()),
     };
-    if let Some(usage) = &coding {
-        balances.push(usage.balance_item());
+    if let Some(snapshot) = &coding {
+        balances.extend(snapshot.items.iter().cloned());
     }
     if balances.is_empty() {
         return Err(match billing_error {
@@ -139,8 +135,8 @@ pub async fn fetch_quota(creds_text: &str) -> Result<QuotaInfo, String> {
         plan_parts.unwrap_or((None, None, None, None));
     // zcode-plan 体系没有套餐（个人套餐账号）时，用 Coding Plan 档位当套餐名。
     if plan_name.is_none() {
-        if let Some(usage) = &coding {
-            plan_name = Some(usage.plan_display_name());
+        if let Some(snapshot) = &coding {
+            plan_name = Some(coding_plan_display_name(&snapshot.level));
         }
     }
 
@@ -153,90 +149,143 @@ pub async fn fetch_quota(creds_text: &str) -> Result<QuotaInfo, String> {
     })
 }
 
-/// Coding Plan（个人套餐）的额度：积分制（非 token 计量），
-/// 数据来自 zcode.z.ai /api/v1/mcp/usage（与 ZCode 桌面端用量统计同源）。
-#[derive(Debug, Clone, PartialEq)]
-pub struct CodingPlanUsage {
+/// Coding Plan（个人套餐，积分制）的额度快照：一组按窗口重置的积分桶。
+///
+/// 数据来自 open.bigmodel.cn /api/monitor/usage/quota/limit，与官网控制台
+/// 显示的"积分 988/2,000、周积分 991/1万"同源。积分与 token 不同量纲，
+/// 条目的 unit_type 标记为 "point"，前端据此区分展示并排除出 token 切换阈值。
+#[derive(Debug, Clone)]
+pub struct CodingPlanSnapshot {
     /// 套餐档位（小写，如 "lite" / "pro" / "max"）。
     pub level: String,
-    pub used: f64,
-    pub limit: f64,
-    pub remaining: f64,
+    /// 积分桶（5 小时窗口的"积分"、每周窗口的"周积分"等）。
+    pub items: Vec<BalanceItem>,
 }
 
-impl CodingPlanUsage {
-    /// 套餐显示名，如 "GLM Coding Lite"。
-    pub fn plan_display_name(&self) -> String {
-        let mut chars = self.level.chars();
-        match chars.next() {
-            Some(first) => format!(
-                "GLM Coding {}{}",
-                first.to_ascii_uppercase(),
-                chars.as_str()
-            ),
-            None => "GLM Coding".into(),
-        }
-    }
-
-    /// 转成额度条目：unit_type=point（积分），前端据此区分展示与切换阈值。
-    fn balance_item(&self) -> BalanceItem {
-        BalanceItem {
-            show_name: self.plan_display_name(),
-            used_units: self.used,
-            total_units: self.limit,
-            remaining_units: self.remaining,
-            unit_type: Some("point".into()),
-            period: None,
-        }
+/// 套餐显示名，如 "GLM Coding Lite"。
+fn coding_plan_display_name(level: &str) -> String {
+    let mut chars = level.chars();
+    match chars.next() {
+        Some(first) => format!(
+            "GLM Coding {}{}",
+            first.to_ascii_uppercase(),
+            chars.as_str()
+        ),
+        None => "GLM Coding".into(),
     }
 }
 
-/// 解析 mcp/usage 响应；未订阅（"不存在coding plan"）或字段缺失时返回 None。
-fn parse_coding_plan_usage(value: &Value) -> Option<CodingPlanUsage> {
-    if value.get("code").and_then(Value::as_i64)? != 0 {
+/// 从 ZCode 的 config.json 读取 Coding Plan（个人套餐）的 BigModel API Key。
+///
+/// ZCode 在用户领取/订阅 Coding Plan 后会把 key 写入
+/// `provider["builtin:bigmodel-coding-plan"].options.apiKey` 并定期刷新；
+/// 官方客户端查积分额度用的就是这把 key（OAuth token 会被 401 拒绝）。
+/// 注意：key 跟随本机 ZCode 的 Coding Plan 登录，不区分 Switcher 档案。
+fn read_coding_plan_api_key() -> Option<String> {
+    let path = crate::profile::zcode_settings_dir()
+        .ok()?
+        .join("config.json");
+    let text = fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    let key = value
+        .get("provider")?
+        .get("builtin:bigmodel-coding-plan")?
+        .get("options")?
+        .get("apiKey")?
+        .as_str()?
+        .trim()
+        .to_string();
+    if key.is_empty() {
+        None
+    } else {
+        Some(key)
+    }
+}
+
+/// 积分桶展示名。unit/number 描述重置窗口：unit=3 & number=5 是 5 小时窗口
+/// （官网叫"积分"），unit=6 & number=1 是每周窗口（官网叫"周积分"）。
+fn credit_window_label(unit: i64, number: i64) -> String {
+    match (unit, number) {
+        (3, 5) => "积分".into(),
+        (6, 1) => "周积分".into(),
+        _ => {
+            let unit_word = match unit {
+                3 => "小时",
+                6 => "周",
+                _ => "周期",
+            };
+            if number == 1 {
+                format!("{unit_word}积分")
+            } else {
+                format!("{number}{unit_word}积分")
+            }
+        }
+    }
+}
+
+/// 解析 quota/limit 响应；未订阅或字段缺失时返回 None。
+fn parse_coding_plan_usage(value: &Value) -> Option<CodingPlanSnapshot> {
+    // 该接口的成功包络是 {"code":200,"success":true,...}（区别于 billing 的 code=0）。
+    let code_ok = value.get("code").and_then(Value::as_i64) == Some(200);
+    let success = value.get("success").and_then(Value::as_bool) == Some(true);
+    if !code_ok && !success {
         return None;
     }
     let data = value.get("data")?;
-    let level = data.get("level")?.as_str()?.trim().to_ascii_lowercase();
-    let usage = data.get("total_usage")?;
-    let used = usage.get("used").and_then(Value::as_f64)?;
-    let limit = usage.get("limit").and_then(Value::as_f64)?;
-    let remaining = usage.get("remaining").and_then(Value::as_f64)?;
-    if !limit.is_finite() || limit <= 0.0 {
+    let level = data
+        .get("level")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let limits = data.get("limits")?.as_array()?;
+    let mut items = Vec::new();
+    for limit in limits {
+        if limit.get("type").and_then(Value::as_str) != Some("CREDIT_LIMIT") {
+            continue;
+        }
+        let total = limit.get("usage").and_then(Value::as_f64)?;
+        let used = limit.get("currentValue").and_then(Value::as_f64)?;
+        let remaining = limit.get("remaining").and_then(Value::as_f64)?;
+        if !total.is_finite() || total <= 0.0 {
+            continue;
+        }
+        let (unit, number) = (
+            limit.get("unit").and_then(Value::as_i64).unwrap_or(0),
+            limit.get("number").and_then(Value::as_i64).unwrap_or(0),
+        );
+        items.push(BalanceItem {
+            show_name: credit_window_label(unit, number),
+            used_units: used,
+            total_units: total,
+            remaining_units: remaining,
+            unit_type: Some("point".into()),
+            // 5 小时窗口与 billing 侧的 "5h" 周期同义，便于后续按周期聚合。
+            period: match (unit, number) {
+                (3, n) if n > 0 => Some("5h".into()),
+                (6, 1) => Some("weekly".into()),
+                _ => None,
+            },
+        });
+    }
+    if items.is_empty() {
         return None;
     }
-    Some(CodingPlanUsage {
-        level,
-        used,
-        limit,
-        remaining,
-    })
+    Some(CodingPlanSnapshot { level, items })
 }
 
 /// 拉取 Coding Plan（个人套餐，积分制）额度。
 ///
-/// 认证与 ZCode 官方客户端一致（三头）：zcodejwttoken 作 Authorization、
-/// BigModel OAuth access token 作 X-Bigmodel-Authorization、
-/// 个人 scope 加 Bigmodel-Target-Type: PERSONAL。
+/// 认证与 ZCode 官方客户端一致：Coding Plan 供应者的 API Key 作
+/// `Authorization: Bearer <key>`（OAuth token 对该接口无效）。
 async fn fetch_coding_plan_usage(
     client: &reqwest::Client,
-    jwt: &str,
-    bigmodel_token: &str,
-) -> Result<CodingPlanUsage, String> {
-    let mut builder = client
-        .get(format!("{}/api/v1/mcp/usage", BASE))
-        .header("Authorization", format!("Bearer {}", jwt))
-        .header(
-            "X-Bigmodel-Authorization",
-            format!("Bearer {}", bigmodel_token),
-        )
-        .header("Bigmodel-Target-Type", "PERSONAL");
-    if let Some(mid) = effective_device_mid() {
-        if let Ok(value) = reqwest::header::HeaderValue::from_str(&mid) {
-            builder = builder.header("X-Device-Mid", value);
-        }
-    }
-    let resp = builder
+    api_key: &str,
+) -> Result<CodingPlanSnapshot, String> {
+    const BIGMODEL_QUOTA_URL: &str = "https://open.bigmodel.cn/api/monitor/usage/quota/limit";
+    let resp = client
+        .get(BIGMODEL_QUOTA_URL)
+        .header("Authorization", format!("Bearer {}", api_key))
         .send()
         .await
         .map_err(|e| format!("请求失败：{}", e))?;
@@ -713,36 +762,54 @@ mod tests {
     #[test]
     fn parse_coding_plan_usage_payload() {
         let value: Value = serde_json::from_str(
-            r#"{"code":0,"msg":"","data":{"server_time":1789447017,"next_refresh_at":1789488000,"level":"lite","total_usage":{"used":120,"limit":1000,"remaining":880}}}"#,
+            r#"{"code":200,"msg":"操作成功","data":{"limits":[
+                {"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":2000,"currentValue":988,"remaining":1011,"percentage":49,"nextResetTime":1789457047532},
+                {"type":"CREDIT_LIMIT","unit":6,"number":1,"usage":10000,"currentValue":991,"remaining":9008,"percentage":9,"nextResetTime":1790007765994}
+            ],"level":"lite"},"success":true}"#,
         )
         .unwrap();
-        let usage = parse_coding_plan_usage(&value).expect("应解析成功");
-        assert_eq!(usage.level, "lite");
-        assert_eq!(usage.used, 120.0);
-        assert_eq!(usage.limit, 1000.0);
-        assert_eq!(usage.remaining, 880.0);
-        assert_eq!(usage.plan_display_name(), "GLM Coding Lite");
+        let snapshot = parse_coding_plan_usage(&value).expect("应解析成功");
+        assert_eq!(snapshot.level, "lite");
+        assert_eq!(snapshot.items.len(), 2);
 
-        let item = usage.balance_item();
-        assert_eq!(item.show_name, "GLM Coding Lite");
-        assert_eq!(item.remaining_units, 880.0);
-        assert_eq!(item.unit_type.as_deref(), Some("point"));
+        // 5 小时窗口的"积分"桶
+        let credits = &snapshot.items[0];
+        assert_eq!(credits.show_name, "积分");
+        assert_eq!(credits.used_units, 988.0);
+        assert_eq!(credits.total_units, 2000.0);
+        assert_eq!(credits.remaining_units, 1011.0);
+        assert_eq!(credits.unit_type.as_deref(), Some("point"));
+        assert_eq!(credits.period.as_deref(), Some("5h"));
+
+        // 每周窗口的"周积分"桶
+        let weekly = &snapshot.items[1];
+        assert_eq!(weekly.show_name, "周积分");
+        assert_eq!(weekly.total_units, 10000.0);
+        assert_eq!(weekly.remaining_units, 9008.0);
+        assert_eq!(weekly.period.as_deref(), Some("weekly"));
+
+        assert_eq!(coding_plan_display_name(&snapshot.level), "GLM Coding Lite");
     }
 
     #[test]
     fn parse_coding_plan_usage_rejects_errors_and_empty() {
-        // 未订阅 coding plan：data 缺 total_usage
-        let none: Value = serde_json::from_str(r#"{"code":1101,"msg":"不存在coding plan"}"#).unwrap();
-        assert!(parse_coding_plan_usage(&none).is_none());
-        // code != 0
-        let err: Value = serde_json::from_str(r#"{"code":401,"msg":"令牌已过期或验证不正确"}"#).unwrap();
-        assert!(parse_coding_plan_usage(&err).is_none());
-        // limit 为 0 视为无效
-        let zero: Value = serde_json::from_str(
-            r#"{"code":0,"data":{"level":"lite","total_usage":{"used":0,"limit":0,"remaining":0}}}"#,
+        // 未订阅 / 无效凭据：code != 200
+        let denied: Value =
+            serde_json::from_str(r#"{"code":401,"msg":"令牌已过期或验证不正确","success":false}"#)
+                .unwrap();
+        assert!(parse_coding_plan_usage(&denied).is_none());
+        // limits 为空 → 无可显示积分
+        let empty: Value =
+            serde_json::from_str(r#"{"code":200,"data":{"limits":[],"level":"lite"}}"#).unwrap();
+        assert!(parse_coding_plan_usage(&empty).is_none());
+        // 非 CREDIT_LIMIT 的条目被跳过
+        let other: Value = serde_json::from_str(
+            r#"{"code":200,"success":true,"data":{"limits":[
+                {"type":"TIME_LIMIT","usage":100,"currentValue":10,"remaining":90}
+            ],"level":"lite"}}"#,
         )
         .unwrap();
-        assert!(parse_coding_plan_usage(&zero).is_none());
+        assert!(parse_coding_plan_usage(&other).is_none());
     }
 
     /// 真机端到端验证：用真实 credentials 走一遍完整刷新链路。
