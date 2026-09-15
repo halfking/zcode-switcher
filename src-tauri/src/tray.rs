@@ -13,11 +13,18 @@ use tauri::{AppHandle, Manager, Runtime};
 
 /// 恢复主窗口：显示 + 取消最小化 + 聚焦。
 /// unminimize 是给「用户先把窗口最小化到任务栏再从托盘点恢复」的场景兜底。
-fn restore_main_window<R: Runtime>(app: &AppHandle<R>) {
+/// 除托盘外，macOS Dock 图标点击（RunEvent::Reopen）也走这里恢复窗口。
+pub(crate) fn restore_main_window<R: Runtime>(app: &AppHandle<R>) {
     if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
+        let shown = window.show();
+        let unminimized = window.unminimize();
+        let focused = window.set_focus();
+        eprintln!(
+            "[restore] main window: show={shown:?} unminimize={unminimized:?} focus={focused:?} visible={:?}",
+            window.is_visible()
+        );
+    } else {
+        eprintln!("[restore] main window not found");
     }
 }
 

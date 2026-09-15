@@ -501,6 +501,14 @@ pub fn run() {
             oauth::oauth_acquire_and_import,
             oauth::oauth_cancel,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // macOS：窗口隐藏到托盘后，点 Dock 图标是用户最自然的重开手势。
+            // 不处理 RunEvent::Reopen 的话，关闭窗口后就再也看不到窗口了。
+            if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
+                eprintln!("[reopen] event fired, has_visible_windows={has_visible_windows}");
+                tray::restore_main_window(app);
+            }
+        });
 }
