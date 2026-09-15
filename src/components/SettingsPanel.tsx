@@ -365,6 +365,8 @@ export default function SettingsPanel() {
     setGlm52AutoSwitchEnabled,
     glm52AutoSwitchThresholdWan,
     setGlm52AutoSwitchThresholdWan,
+    glm52AutoSwitchPointThreshold,
+    setGlm52AutoSwitchPointThreshold,
     autoRestart,
     setAutoRestart,
     tryNoRestartSwitch,
@@ -564,6 +566,27 @@ export default function SettingsPanel() {
             className="focus-ring h-8 w-20 rounded-lg border border-base-border bg-base-card px-2 text-right text-sm font-semibold text-text-primary outline-none transition hover:bg-base-cardhover"
           />
           <span className="text-xs font-medium text-text-muted">{t.tenThousandUnit}</span>
+        </div>
+      </Row>
+
+      <Row
+        icon={<Clock size={15} />}
+        title={t.glmPointThresholdTitle}
+        desc={t.glmPointThresholdDesc}
+      >
+        <div className="flex items-center gap-2">
+          <input
+            type="number"
+            min={10}
+            max={5000}
+            step={10}
+            value={glm52AutoSwitchPointThreshold}
+            onChange={(e) =>
+              setGlm52AutoSwitchPointThreshold(Number(e.currentTarget.value))
+            }
+            className="focus-ring h-8 w-20 rounded-lg border border-base-border bg-base-card px-2 text-right text-sm font-semibold text-text-primary outline-none transition hover:bg-base-cardhover"
+          />
+          <span className="text-xs font-medium text-text-muted">{t.pointUnit}</span>
         </div>
       </Row>
 

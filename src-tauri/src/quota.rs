@@ -344,7 +344,8 @@ fn plan_short_name(plan_name: &str) -> String {
 ///
 /// 数据来自 open.bigmodel.cn /api/monitor/usage/quota/limit，与官网控制台
 /// 显示的"积分 988/2,000、周积分 991/1万"同源。积分与 token 不同量纲，
-/// 条目的 unit_type 标记为 "point"，前端据此区分展示并排除出 token 切换阈值。
+/// 条目的 unit_type 标记为 "point"，前端据此区分展示：模型条目按 token 阈值、
+/// 积分条目按积分阈值参与低额度自动切换判定。
 #[derive(Debug, Clone)]
 pub struct CodingPlanSnapshot {
     /// 套餐档位（小写，如 "lite" / "pro" / "max"）。

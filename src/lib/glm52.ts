@@ -112,6 +112,77 @@ export function glm52Remaining(quota?: QuotaInfo): number | null {
   return items.reduce((sum, item) => sum + balanceRemaining(item), 0);
 }
 
+// 积分条目（GLM Coding 个人套餐的 5h 积分、周积分等，unit_type === "point"）。
+export function pointBalances(quota?: QuotaInfo): BalanceItem[] {
+  return quota?.balances?.filter((item) => item.unit_type === "point") ?? [];
+}
+
+/**
+ * 账号可用积分 = 各积分桶剩余的最小值（最紧的桶决定账号可用性：
+ * 任一窗口的积分耗尽都会被限流），无积分条目时返回 null。
+ */
+export function glmPointRemaining(quota?: QuotaInfo): number | null {
+  const items = pointBalances(quota);
+  if (items.length === 0) return null;
+  return Math.min(...items.map(balanceRemaining));
+}
+
+/**
+ * 当前账号是否应触发切换：token 与积分任一量纲跌破对应阈值即触发。
+ * 条目缺失的量纲不参与判定（该账号可能根本不含此量纲的套餐）。
+ */
+export function isAccountLow(
+  quota: QuotaInfo | undefined,
+  tokenThresholdWan: number,
+  pointThreshold: number
+): boolean {
+  const token = glm52Remaining(quota);
+  if (token !== null && token < tokenThresholdWan * 10_000) return true;
+  const point = glmPointRemaining(quota);
+  if (point !== null && point < pointThreshold) return true;
+  return false;
+}
+
+/**
+ * 候选账号判定：账号已知的每个量纲都必须高于阈值，且至少有一个量纲
+ * 有数据（排除状态未知的账号）。低于阈值的账号永远不会成为切换目标，
+ * 这保证不会在耗尽的账号之间来回循环切换。
+ */
+export function isSwitchableCandidate(
+  quota: QuotaInfo | undefined,
+  tokenThresholdWan: number,
+  pointThreshold: number
+): boolean {
+  if (!quota || quota.error) return false;
+  const token = glm52Remaining(quota);
+  const point = glmPointRemaining(quota);
+  if (token === null && point === null) return false;
+  if (token !== null && token <= tokenThresholdWan * 10_000) return false;
+  if (point !== null && point <= pointThreshold) return false;
+  return true;
+}
+
+/**
+ * 各量纲相对阈值的余量（取最小者），用于候选排序：余量最大的账号
+ * 最“安全”，切过去之后最不容易立刻再次触发切换。
+ */
+export function accountHeadroom(
+  quota: QuotaInfo | undefined,
+  tokenThresholdWan: number,
+  pointThreshold: number
+): number {
+  let headroom = Number.POSITIVE_INFINITY;
+  const token = glm52Remaining(quota);
+  if (token !== null && tokenThresholdWan > 0) {
+    headroom = Math.min(headroom, token / (tokenThresholdWan * 10_000));
+  }
+  const point = glmPointRemaining(quota);
+  if (point !== null && pointThreshold > 0) {
+    headroom = Math.min(headroom, point / pointThreshold);
+  }
+  return headroom;
+}
+
 export function formatQuotaUnits(n: number): string {
   if (!Number.isFinite(n)) return "-";
   const abs = Math.abs(n);
@@ -121,20 +192,22 @@ export function formatQuotaUnits(n: number): string {
 }
 
 // 按剩余额度动态调整监测间隔：越接近切换阈值刷新越快，充裕时放慢轮询。
+// token 与积分取"相对阈值余量"更紧的一端定档；已自动暂停时回到慢速档。
 export const DYNAMIC_REFRESH_MIN_MS = 5_000;
 export const DYNAMIC_REFRESH_MID_MS = 20_000;
 export const DYNAMIC_REFRESH_MAX_MS = 60_000;
 
 export function dynamicQuotaRefreshIntervalMs(
-  remaining: number | null,
-  thresholdWan: number
+  quota: QuotaInfo | undefined,
+  tokenThresholdWan: number,
+  pointThreshold: number,
+  paused: boolean
 ): number {
-  if (remaining === null || !Number.isFinite(remaining)) {
-    return DYNAMIC_REFRESH_MID_MS;
-  }
-  const threshold = Math.max(1, thresholdWan) * 10_000;
-  if (remaining <= threshold) return DYNAMIC_REFRESH_MIN_MS;
-  if (remaining <= threshold * 3) return DYNAMIC_REFRESH_MID_MS;
+  if (paused) return DYNAMIC_REFRESH_MAX_MS;
+  const headroom = accountHeadroom(quota, tokenThresholdWan, pointThreshold);
+  if (!Number.isFinite(headroom)) return DYNAMIC_REFRESH_MID_MS;
+  if (headroom <= 1) return DYNAMIC_REFRESH_MIN_MS;
+  if (headroom <= 3) return DYNAMIC_REFRESH_MID_MS;
   return DYNAMIC_REFRESH_MAX_MS;
 }
 
@@ -149,7 +222,8 @@ export interface Glm52PoolStats {
 export function computeGlm52PoolStats(
   profiles: ProfileView[],
   quotas: Record<string, QuotaInfo>,
-  thresholdWan: number
+  thresholdWan: number,
+  pointThreshold = 0
 ): Glm52PoolStats {
   const thresholdUnits = thresholdWan * 10_000;
   let usedAccounts = 0;
@@ -174,7 +248,8 @@ export function computeGlm52PoolStats(
     rawTotalUnits += total;
     usedUnits += used;
 
-    if (remaining < thresholdUnits) {
+    // token 或积分任一量纲低于阈值即计入"已用完"账号。
+    if (remaining < thresholdUnits || isAccountLow(quotas[profile.id], thresholdWan, pointThreshold)) {
       usedAccounts += 1;
       usedBelowThresholdUnits += thresholdUnits - remaining;
     }

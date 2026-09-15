@@ -9,7 +9,12 @@ import {
   type ProxyStatus,
   type QuotaInfo,
 } from "./lib/api";
-import { glm52Remaining } from "./lib/glm52";
+import {
+  accountHeadroom,
+  glm52Remaining,
+  isAccountLow,
+  isSwitchableCandidate,
+} from "./lib/glm52";
 import { primaryQuotaRemaining } from "./lib/quotaSort";
 import { getTexts, type Language } from "./i18n";
 
@@ -29,6 +34,10 @@ const FLOATING_WINDOW_STORAGE_KEY = "zcs:floatingWindowMode";
 const GLM52_THRESHOLD_WAN_MIN = 10;
 const GLM52_THRESHOLD_WAN_MAX = 500;
 const GLM52_DEFAULT_THRESHOLD_WAN = 200;
+// 积分阈值（GLM Coding 个人套餐的积分桶，如 5h 积分 2000/周积分 1 万）。
+const GLM52_POINT_THRESHOLD_MIN = 10;
+const GLM52_POINT_THRESHOLD_MAX = 5000;
+const GLM52_DEFAULT_POINT_THRESHOLD = 200;
 const DEFAULT_QUOTA_REFRESH_INTERVAL_MINUTES = 10;
 const DEFAULT_ACTIVE_QUOTA_REFRESH_INTERVAL_MINUTES = 1;
 const ACTIVE_QUOTA_REFRESH_INTERVAL_MINUTES_KEY = "zcs:activeQuotaRefreshIntervalMinutes";
@@ -60,8 +69,17 @@ interface AppState {
   /** 用来重置定时器倒计时的 tick */
   scheduledRefreshSeq: number;
   glm52AutoSwitchEnabled: boolean;
-  /** 自动切换阈值，单位：万 */
+  /** 自动切换阈值（模型 token 剩余），单位：万 */
   glm52AutoSwitchThresholdWan: number;
+  /** 自动切换阈值（账号积分剩余），单位：积分；各积分桶取最小值参与判定 */
+  glm52AutoSwitchPointThreshold: number;
+  /**
+   * 无可切换账号时的自动暂停标记（会话内状态，不持久化）：
+   * 暂停期间不做任何切换尝试（监测回落到慢速档），防止在低额度
+   * 账号之间循环切换；当前账号恢复、出现满足双阈值的候选账号或
+   * 重新开启开关时自动解除。
+   */
+  autoSwitchPaused: boolean;
   autoRestart: boolean;
   tryNoRestartSwitch: boolean;
   theme: Theme;
@@ -102,6 +120,8 @@ interface AppState {
   setActiveQuotaRefreshIntervalMinutes: (v: number) => void;
   setGlm52AutoSwitchEnabled: (v: boolean) => void;
   setGlm52AutoSwitchThresholdWan: (v: number) => void;
+  setGlm52AutoSwitchPointThreshold: (v: number) => void;
+  setAutoSwitchPaused: (v: boolean) => void;
   setAutoRestart: (v: boolean) => void;
   setTryNoRestartSwitch: (v: boolean) => void;
   setTheme: (v: Theme) => void;
@@ -140,7 +160,6 @@ interface AppState {
 
 let toastSeq = 1;
 let glm52AutoSwitching = false;
-let lastGlm52NoCandidateAt = 0;
 
 let refreshAllInFlight = false;
 
@@ -256,6 +275,22 @@ function loadGlm52AutoSwitchThresholdWan(): number {
       : GLM52_DEFAULT_THRESHOLD_WAN;
   } catch {
     return GLM52_DEFAULT_THRESHOLD_WAN;
+  }
+}
+function clampGlm52PointThreshold(n: number): number {
+  return Math.max(
+    GLM52_POINT_THRESHOLD_MIN,
+    Math.min(GLM52_POINT_THRESHOLD_MAX, Math.round(n))
+  );
+}
+function loadGlm52AutoSwitchPointThreshold(): number {
+  try {
+    const n = Number(localStorage.getItem("zcs:glm52AutoSwitchPointThreshold"));
+    return Number.isFinite(n) && n > 0
+      ? clampGlm52PointThreshold(n)
+      : GLM52_DEFAULT_POINT_THRESHOLD;
+  } catch {
+    return GLM52_DEFAULT_POINT_THRESHOLD;
   }
 }
 function loadTheme(): Theme {
@@ -411,46 +446,45 @@ async function maybeSwitchGlm52Account(state: AppState) {
   const activeQuota = active ? state.quotas[active.id] : undefined;
   if (!active || !activeQuota || activeQuota.error) return;
 
-  const activeRemaining = glm52Remaining(activeQuota);
-  const threshold = state.glm52AutoSwitchThresholdWan * 10_000;
-  if (activeRemaining === null || activeRemaining >= threshold) return;
+  const tokenWan = state.glm52AutoSwitchThresholdWan;
+  const pointThreshold = state.glm52AutoSwitchPointThreshold;
+
+  // 当前账号 token / 积分任一量纲跌破阈值才需要切换；
+  // 双量纲都恢复到阈值之上时，自动解除暂停继续工作。
+  if (!isAccountLow(activeQuota, tokenWan, pointThreshold)) {
+    if (state.autoSwitchPaused) state.setAutoSwitchPaused(false);
+    return;
+  }
 
   const candidate = state.profiles
     .filter((p) => p.id !== active.id)
-    .map((profile) => ({
-      profile,
-      quota: state.quotas[profile.id],
-      remaining: glm52Remaining(state.quotas[profile.id]),
+    .map((profile) => ({ profile, quota: state.quotas[profile.id] }))
+    .filter((item) => isSwitchableCandidate(item.quota, tokenWan, pointThreshold))
+    .map((item) => ({
+      ...item,
+      headroom: accountHeadroom(item.quota, tokenWan, pointThreshold),
+      tokenRemaining: glm52Remaining(item.quota) ?? 0,
     }))
-    .filter(
-      (item) =>
-        item.remaining !== null &&
-        item.remaining > threshold &&
-        !item.quota?.error
-    )
-    .sort((a, b) => (b.remaining ?? 0) - (a.remaining ?? 0))[0];
+    .sort((a, b) => b.headroom - a.headroom || b.tokenRemaining - a.tokenRemaining)[0];
 
   if (!candidate) {
-    const now = Date.now();
-    if (now - lastGlm52NoCandidateAt > 60_000) {
-      lastGlm52NoCandidateAt = now;
-      state.toast(
-        t.glmNoCandidate.replace(
-          "{threshold}",
-          String(state.glm52AutoSwitchThresholdWan)
-        ),
-        "warn"
-      );
+    // 所有账号的 token/积分都低于阈值：进入自动暂停——暂停期间不做任何
+    // 切换尝试（不会在低额度账号间循环切换），监测也回落到慢速档；
+    // 仅提示一次，等任一账号额度恢复到双阈值之上后自动继续。
+    if (!state.autoSwitchPaused) {
+      state.setAutoSwitchPaused(true);
+      state.toast(t.glmAutoSwitchPaused, "warn");
     }
     return;
   }
 
+  // 出现满足双阈值的候选（含暂停期间额度恢复的情况）：解除暂停并切换。
+  if (state.autoSwitchPaused) state.setAutoSwitchPaused(false);
+
   glm52AutoSwitching = true;
   try {
     state.toast(
-      t.glmAutoSwitching
-        .replace("{threshold}", String(state.glm52AutoSwitchThresholdWan))
-        .replace("{name}", candidate.profile.name),
+      t.glmAutoSwitching.replace("{name}", candidate.profile.name),
       "info"
     );
     await state.switchTo(candidate.profile.id);
@@ -494,6 +528,8 @@ export const useStore = create<AppState>((set, get) => {
     scheduledRefreshSeq: 0,
     glm52AutoSwitchEnabled: loadGlm52AutoSwitchEnabled(),
     glm52AutoSwitchThresholdWan: loadGlm52AutoSwitchThresholdWan(),
+    glm52AutoSwitchPointThreshold: loadGlm52AutoSwitchPointThreshold(),
+    autoSwitchPaused: false,
     autoRestart: initialAutoRestart,
     tryNoRestartSwitch: initialTryNoRestartSwitch,
     theme: initialTheme,
@@ -842,7 +878,12 @@ export const useStore = create<AppState>((set, get) => {
     } catch {
       /* ignore */
     }
-    set({ glm52AutoSwitchEnabled: v });
+    // 重新开启时清掉上一轮的自动暂停，让切换判定从头开始。
+    set(
+      v
+        ? { glm52AutoSwitchEnabled: true, autoSwitchPaused: false }
+        : { glm52AutoSwitchEnabled: false }
+    );
   },
 
   setGlm52AutoSwitchThresholdWan: (v) => {
@@ -856,6 +897,24 @@ export const useStore = create<AppState>((set, get) => {
       /* ignore */
     }
     set({ glm52AutoSwitchThresholdWan: wan });
+  },
+
+  setGlm52AutoSwitchPointThreshold: (v) => {
+    const point =
+      Number.isFinite(v) && v > 0
+        ? clampGlm52PointThreshold(v)
+        : GLM52_DEFAULT_POINT_THRESHOLD;
+    try {
+      localStorage.setItem("zcs:glm52AutoSwitchPointThreshold", String(point));
+    } catch {
+      /* ignore */
+    }
+    set({ glm52AutoSwitchPointThreshold: point });
+  },
+
+  setAutoSwitchPaused: (v) => {
+    if (get().autoSwitchPaused === v) return;
+    set({ autoSwitchPaused: v });
   },
 
   setAutoRestart: (v) => {

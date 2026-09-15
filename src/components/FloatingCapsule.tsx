@@ -7,6 +7,7 @@ interface Props {
   profiles: ProfileView[];
   quotas: Record<string, QuotaInfo>;
   thresholdWan: number;
+  pointThreshold: number;
   language: Language;
   scale: number;
   resizerOpen: boolean;
@@ -26,6 +27,7 @@ export default function FloatingCapsule({
   profiles,
   quotas,
   thresholdWan,
+  pointThreshold,
   language,
   scale,
   resizerOpen,
@@ -34,7 +36,7 @@ export default function FloatingCapsule({
   onClose,
 }: Props) {
   const t = getTexts(language);
-  const stats = computeGlm52PoolStats(profiles, quotas, thresholdWan);
+  const stats = computeGlm52PoolStats(profiles, quotas, thresholdWan, pointThreshold);
   const pct =
     stats.totalUnits > 0
       ? Math.min(100, Math.max(0, (stats.usedUnits / stats.totalUnits) * 100))

@@ -20,7 +20,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { check as checkUpdate } from "@tauri-apps/plugin-updater";
 import { useStore } from "./store";
 import { api, type CurrentStatus } from "./lib/api";
-import { dynamicQuotaRefreshIntervalMs, glm52Remaining } from "./lib/glm52";
+import { dynamicQuotaRefreshIntervalMs } from "./lib/glm52";
 import { LogicalSize, getCurrentWindow } from "@tauri-apps/api/window";
 import { LANGUAGES, formatText, getTexts } from "./i18n";
 import zcodeLogo from "./assets/zcode-logo.png";
@@ -95,6 +95,7 @@ export default function App() {
     activeQuotaRefreshIntervalMinutes,
     glm52AutoSwitchEnabled,
     glm52AutoSwitchThresholdWan,
+    glm52AutoSwitchPointThreshold,
     floatingWindowMode,
     floatingWindowScale,
     theme,
@@ -283,15 +284,20 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [quotaRefreshIntervalMinutes, scheduledRefreshAllQuota, scheduledRefreshSeq, sortedProfileIds]);
 
-  // 动态间隔：自动切换开启时按当前账号剩余额度取 5s/20s/60s 档位，关闭时用用户配置。
+  // 动态间隔：自动切换开启时按当前账号 token/积分相对阈值的余量取 5s/20s/60s 档位；
+  // 已自动暂停（无可切换账号）时回到慢速档，关闭时用用户配置。
   const computeActiveRefreshIntervalMs = useCallback(() => {
     if (!glm52AutoSwitchEnabled) {
       return activeQuotaRefreshIntervalMinutes * 60 * 1000;
     }
     const state = useStore.getState();
     const active = state.profiles.find((p) => p.active);
-    const remaining = glm52Remaining(active ? state.quotas[active.id] : undefined);
-    return dynamicQuotaRefreshIntervalMs(remaining, state.glm52AutoSwitchThresholdWan);
+    return dynamicQuotaRefreshIntervalMs(
+      active ? state.quotas[active.id] : undefined,
+      state.glm52AutoSwitchThresholdWan,
+      state.glm52AutoSwitchPointThreshold,
+      state.autoSwitchPaused
+    );
   }, [activeQuotaRefreshIntervalMinutes, glm52AutoSwitchEnabled]);
 
   // 自调度 setTimeout：每次刷新完成后按最新剩余额度重算下一次间隔。
@@ -651,6 +657,7 @@ export default function App() {
         profiles={profiles}
         quotas={quotas}
         thresholdWan={glm52AutoSwitchThresholdWan}
+        pointThreshold={glm52AutoSwitchPointThreshold}
         language={language}
         scale={floatingWindowScale}
         resizerOpen={floatingResizerOpen}
