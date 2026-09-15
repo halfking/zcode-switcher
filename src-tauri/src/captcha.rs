@@ -8,7 +8,7 @@ use tauri::{AppHandle, Manager};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
-pub const ZCODE_APP_VERSION: &str = "3.1.8";
+pub const ZCODE_APP_VERSION: &str = "3.11.2";
 const CONFIG_BASE_URL: &str = "https://zcode.z.ai/api/v1/client/configs";
 const CONFIG_TTL: Duration = Duration::from_secs(10 * 60);
 const VERIFY_PARAM_TTL: Duration = Duration::from_secs(45);

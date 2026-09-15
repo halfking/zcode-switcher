@@ -2,6 +2,7 @@
 //!
 //! - GET https://zcode.z.ai/api/v1/zcode-plan/billing/balance?app_version=... → 当前套餐 + 用量/余额
 
+use rand::{rngs::OsRng, RngCore};
 use serde::Deserialize;
 use serde_json::Value;
 use std::{fs, path::PathBuf, time::SystemTime};
@@ -9,7 +10,7 @@ use std::{fs, path::PathBuf, time::SystemTime};
 use crate::crypto;
 
 const BASE: &str = "https://zcode.z.ai";
-const APP_VERSION_CANDIDATES: &[&str] = &["3.2.5", crate::captcha::ZCODE_APP_VERSION];
+const APP_VERSION_CANDIDATES: &[&str] = &["3.11.2", "3.2.5", crate::captcha::ZCODE_APP_VERSION];
 
 /// 单个模型的用量条目（balance.data.balances[]）。
 #[derive(Debug, Clone, serde::Serialize, Deserialize)]
@@ -76,8 +77,19 @@ pub async fn fetch_quota(creds_text: &str) -> Result<QuotaInfo, String> {
     let token =
         crypto::extract_jwt_token(&creds).ok_or_else(|| "无法解出 zcodejwttoken".to_string())?;
 
+    // billing 接口要求 X-Device-Mid（缺失时服务端返回 HTTP 400 code=3001
+    // "parameter error"）。ZCode 桌面端把设备标识持久化在 telemetry-state.json，
+    // 这里优先读同一个文件、带同一个值；本机没跑过 ZCode 桌面端时（典型场景：
+    // 干净虚机上只装 Switcher），退回 Switcher 自己生成并持久化的设备标识。
+    let mut default_headers = reqwest::header::HeaderMap::new();
+    if let Some(mid) = effective_device_mid() {
+        if let Ok(value) = reqwest::header::HeaderValue::from_str(&mid) {
+            default_headers.insert("X-Device-Mid", value);
+        }
+    }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
+        .default_headers(default_headers)
         .build()
         .map_err(|e| format!("HTTP 客户端创建失败：{}", e))?;
 
@@ -168,6 +180,90 @@ fn current_credentials_match(token: &str) -> bool {
         return false;
     };
     crypto::extract_jwt_token(&creds).as_deref() == Some(token)
+}
+
+/// 读取 ZCode 持久化的设备标识（~/.zcode/v2/telemetry-state.json 的 deviceMid）。
+fn read_device_mid() -> Option<String> {
+    let path = dirs::home_dir()?
+        .join(".zcode")
+        .join("v2")
+        .join("telemetry-state.json");
+    let text = fs::read_to_string(path).ok()?;
+    parse_device_mid(&text)
+}
+
+/// billing 请求实际使用的设备标识：
+/// 1. ZCode 桌面端持久化的 telemetry-state.json（保持与其自身请求同源）；
+/// 2. 缺失时（干净虚机上没装过 ZCode 桌面端）用 Switcher 生成并持久化在
+///    `zcode-switcher-device.json` 的兜底设备标识。持久化是必须的：每次请求
+///    换一个设备 ID 会显得异常，也浪费服务端风控的信任。
+fn effective_device_mid() -> Option<String> {
+    read_device_mid().or_else(persistent_fallback_device_mid)
+}
+
+fn fallback_device_mid_path() -> Option<PathBuf> {
+    crate::profile::zcode_settings_dir()
+        .ok()
+        .map(|dir| dir.join("zcode-switcher-device.json"))
+}
+
+fn persistent_fallback_device_mid() -> Option<String> {
+    let path = fallback_device_mid_path()?;
+    if let Ok(text) = fs::read_to_string(&path) {
+        if let Some(mid) = parse_device_mid(&text) {
+            return Some(mid);
+        }
+    }
+    let mid = new_device_mid();
+    if write_fallback_device_mid(&path, &mid).is_err() {
+        return None;
+    }
+    Some(mid)
+}
+
+/// 生成 UUID v4 形态的设备标识（与 ZCode telemetry-state.json 中 deviceMid 同构）。
+fn new_device_mid() -> String {
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    format_device_mid(&bytes)
+}
+
+fn format_device_mid(bytes: &[u8; 16]) -> String {
+    let mut out = String::with_capacity(36);
+    for (index, byte) in bytes.iter().enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            out.push('-');
+        }
+        let mut byte = *byte;
+        // RFC 4122：第 7 字节高 4 位为版本 4，第 9 字节高 2 位为 10。
+        if index == 6 {
+            byte = (byte & 0x0f) | 0x40;
+        }
+        if index == 8 {
+            byte = (byte & 0x3f) | 0x80;
+        }
+        out.push_str(&format!("{:02x}", byte));
+    }
+    out
+}
+
+fn write_fallback_device_mid(path: &std::path::Path, mid: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::to_vec_pretty(&serde_json::json!({ "deviceMid": mid }))
+        .map_err(std::io::Error::other)?;
+    fs::write(path, body)
+}
+
+fn parse_device_mid(text: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    value
+        .get("deviceMid")?
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 fn newest_log_files() -> Option<Vec<PathBuf>> {
@@ -330,6 +426,7 @@ fn friendly_balance_error(error: Option<&str>) -> &'static str {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::time::UNIX_EPOCH;
 
     #[test]
     fn parse_start_plan_from_balance_payload() {
@@ -421,5 +518,84 @@ mod tests {
         let data = parse_logged_balance_line(line).unwrap();
         assert_eq!(data.plans.len(), 1);
         assert_eq!(data.balances.len(), 2);
+    }
+
+    #[test]
+    fn parse_device_mid_from_telemetry_state() {
+        assert_eq!(
+            parse_device_mid(r#"{"deviceMid":"957a0788-30eb-4aa9-9c71-1fcc3b92e8aa"}"#),
+            Some("957a0788-30eb-4aa9-9c71-1fcc3b92e8aa".into())
+        );
+        assert_eq!(
+            parse_device_mid(r#"{"deviceMid": "  padded  ","lastDailyActiveDate":"2026-09-15"}"#),
+            Some("padded".into())
+        );
+        assert_eq!(parse_device_mid(r#"{}"#), None);
+        assert_eq!(parse_device_mid(r#"{"deviceMid":""}"#), None);
+        assert_eq!(parse_device_mid("not json"), None);
+    }
+
+    #[test]
+    fn generated_device_mid_is_uuid_v4_shaped() {
+        let mid = new_device_mid();
+        assert_eq!(mid.len(), 36);
+        let dashes: Vec<usize> = mid
+            .char_indices()
+            .filter(|(_, ch)| *ch == '-')
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(dashes, vec![8, 13, 18, 23]);
+        let hex: String = mid.chars().filter(|ch| *ch != '-').collect();
+        assert!(hex.chars().all(|ch| ch.is_ascii_hexdigit()));
+        // 版本 4 + RFC 4122 变体位
+        assert_eq!(hex.as_bytes()[12], b'4');
+        assert!(matches!(
+            hex.as_bytes()[16],
+            b'8' | b'9' | b'a' | b'b'
+        ));
+        // 连续生成不重复
+        assert_ne!(mid, new_device_mid());
+    }
+
+    #[test]
+    fn fallback_device_mid_roundtrip_and_reuse() {
+        let dir = std::env::temp_dir().join(format!(
+            "zcs-quota-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        let path = dir.join("zcode-switcher-device.json");
+        let mid = new_device_mid();
+        write_fallback_device_mid(&path, &mid).expect("write fallback device mid");
+        // 落盘的文件能被 parse_device_mid 读回（与 telemetry-state.json 同构）。
+        let text = fs::read_to_string(&path).expect("read back");
+        assert_eq!(parse_device_mid(&text).as_deref(), Some(mid.as_str()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// 真机端到端验证：用真实 credentials 走一遍完整刷新链路。
+    /// 仅手动运行：`cargo test -p zcode-switcher --lib --release -- --ignored fetch_quota_real`
+    #[test]
+    #[ignore = "依赖本机 ~/.zcode/v2 凭据与外网，仅手动运行"]
+    fn fetch_quota_real_credentials() {
+        let home = dirs::home_dir().expect("home dir");
+        let text = std::fs::read_to_string(
+            home.join(".zcode").join("v2").join("credentials.json"),
+        )
+        .expect("credentials.json");
+        let info = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(fetch_quota(&text))
+            .expect("fetch_quota 应成功");
+        println!(
+            "plan={:?} status={:?} balances={}",
+            info.plan_name,
+            info.plan_status,
+            info.balances.len()
+        );
+        assert!(!info.balances.is_empty(), "balances 不应为空");
     }
 }

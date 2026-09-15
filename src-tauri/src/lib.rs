@@ -333,8 +333,66 @@ fn default_download_filename() -> String {
     format!("download-{}", timestamp)
 }
 
+/// 真机端到端验证额度刷新（`zcode-switcher.exe --quota-probe [credentials 路径]`）。
+/// 只打印套餐与额度明细，不打印任何 token / 密钥。返回进程退出码。
+fn quota_probe_cli() -> i32 {
+    let path = std::env::args()
+        .nth(2)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = dirs::home_dir().expect("无法确定用户目录");
+            home.join(".zcode").join("v2").join("credentials.json")
+        });
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("读取 {} 失败：{}", path.display(), e);
+            return 1;
+        }
+    };
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("tokio runtime 创建失败：{}", e);
+            return 1;
+        }
+    };
+    match runtime.block_on(quota::fetch_quota(&text)) {
+        Ok(info) => {
+            println!("刷新结果: 成功");
+            println!("套餐: {:?}", info.plan_name);
+            println!("状态: {:?}", info.plan_status);
+            println!("额度条目 ({}):", info.balances.len());
+            for item in &info.balances {
+                println!(
+                    "  - {:<16} 剩余 {:>10.0} / {:>10.0} ({})",
+                    item.show_name,
+                    item.remaining_units,
+                    item.total_units,
+                    item.period.as_deref().unwrap_or("-")
+                );
+            }
+            if info.balances.is_empty() {
+                eprintln!("!! balances 为空");
+                return 2;
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("刷新结果: 失败");
+            eprintln!("错误: {}", e);
+            1
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // --quota-probe：无窗口的真机验证模式（bin 目标自带 manifest，可在
+    // 无 cargo test 环境下验证完整刷新链路）。
+    if std::env::args().nth(1).as_deref() == Some("--quota-probe") {
+        std::process::exit(quota_probe_cli());
+    }
     tauri::Builder::default()
         // Register single-instance before deep-link so callback URLs reuse the
         // existing window instead of opening a second process.
