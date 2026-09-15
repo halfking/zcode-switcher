@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>ZCode Switcher 验证码求解</title>
+  <style>
+    html, body { margin: 0; padding: 12px; font-family: system-ui, sans-serif; background: #fff; }
+    #captcha-button { margin-bottom: 8px; }
+    #status { color: #666; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <!-- 阿里云验证码 SDK 要求 page 上存在 button + element 两个挂载点（popup 模式）。 -->
+  <button id="captcha-button" type="button">开始验证</button>
+  <div id="captcha-element"></div>
+  <div id="status">等待调用…</div>
+  <script>
+    (function () {
+      'use strict';
+
+      var reported = false;
+      var sdkLoadedAt = 0;
+      // 智谱客户端 wat()：SDK 加载完成后至少等 2 秒再触发验证（风控节奏）。
+      var TRIGGER_PACING_MS = 2000;
+
+      function setStatus(text) {
+        var el = document.getElementById('status');
+        if (el) el.textContent = text;
+      }
+
+      // 把结果经 IPC 告诉 Rust（captcha_solver_result 命令）。plain browser
+      // 里调试（无 __TAURI_INTERNALS__）时只打印，不上报。
+      function report(param, error) {
+        if (reported) return;
+        reported = true;
+        setStatus(error ? ('失败：' + error) : '已取得 verify param');
+        var payload = {
+          label: (window.__zcsConfig || {}).label || '',
+          param: param || null,
+          error: error || null,
+        };
+        try {
+          window.__TAURI_INTERNALS__.invoke('captcha_solver_result', payload);
+        } catch (e) {
+          console.error('[captcha-solver] 无 Tauri IPC，结果仅打印：', payload);
+        }
+      }
+      window.__zcsReport = report;
+
+      function loadSdk(src, timeoutMs) {
+        return new Promise(function (resolve, reject) {
+          var done = false;
+          var script = document.createElement('script');
+          script.src = src;
+          script.async = true;
+          var timer = setTimeout(function () {
+            if (done) return;
+            done = true;
+            reject(new Error('验证码 SDK 加载超时'));
+          }, timeoutMs);
+          script.onload = function () {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            sdkLoadedAt = Date.now();
+            resolve();
+          };
+          script.onerror = function () {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            reject(new Error('验证码 SDK 加载失败（网络或 CDN 不可达）'));
+          };
+          document.head.appendChild(script);
+        });
+      }
+
+      // —— fail 事件解析：与智谱客户端 _X()/yX()/bX()/vX() 逻辑一致 ——
+      // fail 事件可能是对象或 JSON 字符串；terminal pass 时 captchaVerifyParam
+      // 直接挂在事件上，可以直接采用。
+      function parseFailEvent(event) {
+        var obj = event && typeof event === 'object' ? event : null;
+        if (!obj && typeof event === 'string' && event.trim().indexOf('{') === 0) {
+          try { obj = JSON.parse(event); } catch (e) { obj = null; }
+        }
+        var out = {
+          success: undefined,
+          verifyResult: undefined,
+          verifyCode: null,
+          certifyId: null,
+          param: null,
+          raw: typeof event === 'string' ? event : JSON.stringify(event),
+        };
+        if (obj) {
+          out.success = typeof obj.success === 'boolean' ? obj.success : undefined;
+          out.verifyResult = typeof obj.verifyResult === 'boolean' ? obj.verifyResult : undefined;
+          out.verifyCode =
+            (typeof obj.verifyCode === 'string' && obj.verifyCode) ||
+            (typeof obj.VerifyCode === 'string' && obj.VerifyCode) ||
+            null;
+          out.certifyId = typeof obj.certifyId === 'string' ? obj.certifyId : null;
+          var param =
+            (typeof obj.captchaVerifyParam === 'string' && obj.captchaVerifyParam) ||
+            (typeof obj.CaptchaVerifyParam === 'string' && obj.CaptchaVerifyParam) ||
+            '';
+          out.param = param.trim() ? param.trim() : null;
+        }
+        return out;
+      }
+
+      // success && verifyResult（或 T006）= 风控判定通过，fail 回调里也带可用 param。
+      function isTerminalPass(failInfo) {
+        return (
+          (failInfo.success === true && failInfo.verifyResult === true) ||
+          failInfo.verifyCode === 'T006'
+        );
+      }
+
+      function handleFail(event) {
+        var info = parseFailEvent(event);
+        if (isTerminalPass(info) && info.param) {
+          report(info.param, null);
+          return;
+        }
+        if (info.verifyCode === 'F008') {
+          report(null, '验证码 param 重复提交（F008），需要重新求解');
+          return;
+        }
+        var detail = info.verifyCode ? ('code=' + info.verifyCode + ' ') : '';
+        report(null, 'SDK fail ' + detail + (info.raw || '').slice(0, 300));
+      }
+
+      // Rust 侧通过 eval 调用：window.__zcsRun({scene, prefix, region, language, label})
+      window.__zcsRun = function (cfg) {
+        window.__zcsConfig = cfg || {};
+        reported = false;
+        var region = (cfg && cfg.region) || 'cn';
+        var prefix = (cfg && cfg.prefix) || '';
+        var language = (cfg && cfg.language) || 'cn';
+        setStatus('加载验证码 SDK…');
+        loadSdk('https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js', 12000)
+          .then(function () {
+            if (typeof window.initAliyunCaptcha !== 'function') {
+              report(null, 'initAliyunCaptcha 未定义（SDK 内容异常）');
+              return;
+            }
+            // 智谱客户端在 init 前设置全局 region/prefix（SDK 内部读取）。
+            window.AliyunCaptchaConfig = { region: region, prefix: prefix };
+
+            var paced = false;
+            function paceAndStart() {
+              if (paced) return;
+              paced = true;
+              var wait = Math.max(0, TRIGGER_PACING_MS - (Date.now() - sdkLoadedAt));
+              setTimeout(function () {
+                setStatus('触发无痕验证…');
+                try {
+                  var instance = window.__zcsInstance;
+                  if (instance && typeof instance.startTracelessVerification === 'function') {
+                    // 与智谱客户端一致：优先无痕验证（不弹滑块）。
+                    instance.startTracelessVerification();
+                  } else {
+                    report(null, '验证码实例不支持无痕验证（startTracelessVerification 缺失）');
+                  }
+                } catch (e) {
+                  report(null, '触发无痕验证失败：' + (e && e.message));
+                }
+              }, wait);
+            }
+
+            setStatus('初始化验证码…');
+            try {
+              window.initAliyunCaptcha({
+                SceneId: cfg.scene,
+                mode: 'popup',
+                language: language,
+                showErrorTip: false,
+                element: '#captcha-element',
+                button: '#captcha-button',
+                getInstance: function (instance) {
+                  window.__zcsInstance = instance;
+                  paceAndStart();
+                },
+                // 官方客户端用 success/fail/onError 拿 param（success 直接收字符串）。
+                success: function (param) {
+                  var value =
+                    typeof param === 'string'
+                      ? param
+                      : (param && param.captchaVerifyParam) || '';
+                  report(value.trim() ? value.trim() : null, value.trim() ? null : 'SDK success 回调未包含 verify param');
+                },
+                fail: handleFail,
+                onError: function (e) {
+                  report(null, 'SDK error: ' + ((e && e.message) || String(e)));
+                },
+                // 兼容 captchaVerifyCallback 形态（不同 SDK 版本二选一触发，reported 去重）。
+                captchaVerifyCallback: function (captchaVerifyParam) {
+                  var value =
+                    typeof captchaVerifyParam === 'string'
+                      ? captchaVerifyParam
+                      : (captchaVerifyParam && captchaVerifyParam.captchaVerifyParam) || '';
+                  report(value.trim() ? value.trim() : null, value.trim() ? null : 'SDK 回调未包含 verify param');
+                  return Promise.resolve({ captchaResult: true, bizResult: true });
+                },
+                onBizResultCallback: function () {},
+              });
+            } catch (e) {
+              report(null, 'initAliyunCaptcha 异常：' + (e && e.message));
+            }
+          })
+          .catch(function (e) {
+            report(null, (e && e.message) || 'SDK 加载失败');
+          });
+      };
+    })();
+  </script>
+</body>
+</html>

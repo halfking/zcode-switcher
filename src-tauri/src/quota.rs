@@ -102,13 +102,33 @@ pub async fn fetch_quota(creds_text: &str) -> Result<QuotaInfo, String> {
         }
     };
 
-    // Coding Plan（个人套餐，积分制）的额度不在 zcode-plan 体系里：
-    // 个人套餐账号调 billing/balance 拿不到积分，需要用 Coding Plan API Key
-    // 单独查 open.bigmodel.cn 的 quota/limit（与官网控制台同源）。
-    let coding = match read_coding_plan_api_key() {
-        Some(key) => fetch_coding_plan_usage(&client, &key).await.ok(),
-        None => None,
-    };
+    // Coding Plan（个人套餐，积分制）和 Start Plan（体验套餐）的额度
+    // 不在 zcode-plan 体系里。优先从 mcp/usage（三头认证）获取个人套餐积分桶；
+    // 若失败则降级到用各自供应者的 API Key 查 quota/limit。
+    let mut coding: Option<CodingPlanSnapshot> = None;
+    
+    // 优先尝试 mcp/usage（需要 OAuth token）
+    match fetch_mcp_usage(&client, &token, &creds).await {
+        Ok(mcp) => {
+            coding = Some(mcp);
+        }
+        Err(_e) => {
+            // 降级到 quota/limit（需要 API Key）
+            let coding_key = read_bigmodel_provider_key("builtin:bigmodel-coding-plan");
+            let start_key = read_bigmodel_provider_key("builtin:bigmodel-start-plan");
+            if let Some(key) = coding_key {
+                coding = fetch_coding_plan_usage(&client, &key).await.ok();
+            }
+            if let Some(key) = start_key {
+                if let Ok(start) = fetch_coding_plan_usage(&client, &key).await {
+                    match &mut coding {
+                        Some(c) => c.items.extend(start.items),
+                        None => coding = Some(start),
+                    }
+                }
+            }
+        }
+    }
 
     let (plan_parts, mut balances) = match balance {
         Some(balance) => {
@@ -175,13 +195,12 @@ fn coding_plan_display_name(level: &str) -> String {
     }
 }
 
-/// 从 ZCode 的 config.json 读取 Coding Plan（个人套餐）的 BigModel API Key。
+/// 从 ZCode 的 config.json 读取指定供应者的 BigModel API Key。
 ///
-/// ZCode 在用户领取/订阅 Coding Plan 后会把 key 写入
-/// `provider["builtin:bigmodel-coding-plan"].options.apiKey` 并定期刷新；
-/// 官方客户端查积分额度用的就是这把 key（OAuth token 会被 401 拒绝）。
-/// 注意：key 跟随本机 ZCode 的 Coding Plan 登录，不区分 Switcher 档案。
-fn read_coding_plan_api_key() -> Option<String> {
+/// ZCode 在用户领取/订阅后会把 key 写入对应供应者的 options.apiKey 并定期刷新；
+/// 官方客户端查额度用的就是这把 key（OAuth token 会被 401 拒绝）。
+/// 注意：key 跟随本机 ZCode 登录，不区分 Switcher 档案。
+fn read_bigmodel_provider_key(provider_id: &str) -> Option<String> {
     let path = crate::profile::zcode_settings_dir()
         .ok()?
         .join("config.json");
@@ -189,7 +208,7 @@ fn read_coding_plan_api_key() -> Option<String> {
     let value: Value = serde_json::from_str(&text).ok()?;
     let key = value
         .get("provider")?
-        .get("builtin:bigmodel-coding-plan")?
+        .get(provider_id)?
         .get("options")?
         .get("apiKey")?
         .as_str()?
@@ -278,25 +297,127 @@ fn parse_coding_plan_usage(value: &Value) -> Option<CodingPlanSnapshot> {
 ///
 /// 认证与 ZCode 官方客户端一致：Coding Plan 供应者的 API Key 作
 /// `Authorization: Bearer <key>`（OAuth token 对该接口无效）。
+/// 多档案顺序刷新会连续请求该接口，429/网络抖动时退避重试一次。
 async fn fetch_coding_plan_usage(
     client: &reqwest::Client,
     api_key: &str,
 ) -> Result<CodingPlanSnapshot, String> {
     const BIGMODEL_QUOTA_URL: &str = "https://open.bigmodel.cn/api/monitor/usage/quota/limit";
+    const MAX_ATTEMPTS: usize = 2;
+    let mut last_err = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        }
+        let resp = match client
+            .get(BIGMODEL_QUOTA_URL)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                last_err = Some(format!("请求失败：{}", e));
+                continue;
+            }
+        };
+        if !resp.status().is_success() {
+            // 429 按 Retry-After 退避（缺省 2s，封顶 10s），其余状态码直接报错。
+            if resp.status().as_u16() == 429 && attempt + 1 < MAX_ATTEMPTS {
+                let wait = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .unwrap_or(2)
+                    .clamp(1, 10);
+                last_err = Some("积分额度限流".into());
+                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                continue;
+            }
+            return Err(format!("状态码 {}", resp.status()));
+        }
+        let value: Value = match resp.json().await {
+            Ok(value) => value,
+            Err(e) => {
+                last_err = Some(format!("解析失败：{}", e));
+                continue;
+            }
+        };
+        return parse_coding_plan_usage(&value)
+            .ok_or_else(|| "Coding Plan 额度不可用（可能未订阅）".into());
+    }
+    Err(last_err.unwrap_or_else(|| "积分额度请求失败".into()))
+}
+
+/// 拉取个人套餐积分额度（从 ZCode mcp/usage 接口）。
+///
+/// 用三头认证：JWT token + OAuth access_token + Bigmodel-Target-Type: PERSONAL。
+/// 返回格式与 fetch_coding_plan_usage 一致（CodingPlanSnapshot），便于合并。
+async fn fetch_mcp_usage(
+    client: &reqwest::Client,
+    jwt_token: &str,
+    creds: &Value,
+) -> Result<CodingPlanSnapshot, String> {
+    const MCP_USAGE_URL: &str = "https://zcode.z.ai/api/v1/mcp/usage";
+    
+    // 从 credentials.json 读取并解密 OAuth access_token
+    let oauth_token = creds
+        .get("oauth:bigmodel:access_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "credentials 缺少 oauth:bigmodel:access_token".to_string())?;
+    
+    let decrypted_oauth = crypto::decrypt(oauth_token)
+        .map_err(|e| format!("解密 OAuth token 失败：{}", e))?;
+    
     let resp = client
-        .get(BIGMODEL_QUOTA_URL)
-        .header("Authorization", format!("Bearer {}", api_key))
+        .get(MCP_USAGE_URL)
+        .header("Authorization", format!("Bearer {}", jwt_token))
+        .header("X-Bigmodel-Authorization", format!("Bearer {}", decrypted_oauth))
+        .header("Bigmodel-Target-Type", "PERSONAL")
         .send()
         .await
-        .map_err(|e| format!("请求失败：{}", e))?;
+        .map_err(|e| format!("mcp/usage 请求失败：{}", e))?;
+    
     if !resp.status().is_success() {
-        return Err(format!("状态码 {}", resp.status()));
+        return Err(format!("mcp/usage 状态码 {}", resp.status()));
     }
-    let value: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("解析失败：{}", e))?;
-    parse_coding_plan_usage(&value).ok_or_else(|| "Coding Plan 额度不可用（可能未订阅）".into())
+    
+    let value: Value = resp.json().await
+        .map_err(|e| format!("mcp/usage 解析失败：{}", e))?;
+    
+    parse_mcp_usage(&value)
+        .ok_or_else(|| "mcp/usage 响应格式异常".to_string())
+}
+
+/// 解析 mcp/usage 响应，提取积分桶。
+fn parse_mcp_usage(value: &Value) -> Option<CodingPlanSnapshot> {
+    // mcp/usage 返回信封格式 {code, data: {level, total_usage}}
+    let data = value.get("data").unwrap_or(value);
+    let level = data.get("level")?.as_str()?;
+    let usage = data.get("total_usage")?;
+    let used = usage.get("used")?.as_f64()?;
+    let limit = usage.get("limit")?.as_f64()?;
+    let remaining = usage.get("remaining")?.as_f64()?;
+    
+    let plan_name = match level {
+        "lite" => "GLM Coding Lite",
+        "pro" => "GLM Coding Pro",
+        "max" => "GLM Coding Max",
+        _ => "GLM Coding",
+    };
+    
+    Some(CodingPlanSnapshot {
+        level: level.to_string(),
+        items: vec![BalanceItem {
+            show_name: plan_name.into(),
+            used_units: used,
+            total_units: limit,
+            remaining_units: remaining,
+            unit_type: Some("point".into()),
+            period: None,
+        }],
+    })
 }
 
 fn pick_best_plan(
