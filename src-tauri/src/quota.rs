@@ -103,28 +103,25 @@ pub async fn fetch_quota(creds_text: &str) -> Result<QuotaInfo, String> {
     };
 
     // Coding Plan（个人套餐，积分制）和 Start Plan（体验套餐）的额度
-    // 不在 zcode-plan 体系里。优先从 mcp/usage（三头认证）获取个人套餐积分桶；
-    // 若失败则降级到用各自供应者的 API Key 查 quota/limit。
+    // 不在 zcode-plan 体系里。优先从 mcp/usage（OAuth 三头认证）获取个人套餐积分；
+    // 若失败则降级到用各自供应者的 API Key 查 quota/limit（但 ZCode 不再存储 API Key）。
     let mut coding: Option<CodingPlanSnapshot> = None;
     
-    // 优先尝试 mcp/usage（需要 OAuth token）
-    match fetch_mcp_usage(&client, &token, &creds).await {
-        Ok(mcp) => {
-            coding = Some(mcp);
+    // 优先尝试 mcp/usage（需要 OAuth token，返回总积分桶）
+    if let Ok(mcp) = fetch_mcp_usage(&client, &token, &creds).await {
+        coding = Some(mcp);
+    } else {
+        // 降级到 quota/limit（需要 API Key，通常已不可用）
+        let coding_key = read_bigmodel_provider_key("builtin:bigmodel-coding-plan");
+        let start_key = read_bigmodel_provider_key("builtin:bigmodel-start-plan");
+        if let Some(key) = coding_key {
+            coding = fetch_coding_plan_usage(&client, &key).await.ok();
         }
-        Err(_e) => {
-            // 降级到 quota/limit（需要 API Key）
-            let coding_key = read_bigmodel_provider_key("builtin:bigmodel-coding-plan");
-            let start_key = read_bigmodel_provider_key("builtin:bigmodel-start-plan");
-            if let Some(key) = coding_key {
-                coding = fetch_coding_plan_usage(&client, &key).await.ok();
-            }
-            if let Some(key) = start_key {
-                if let Ok(start) = fetch_coding_plan_usage(&client, &key).await {
-                    match &mut coding {
-                        Some(c) => c.items.extend(start.items),
-                        None => coding = Some(start),
-                    }
+        if let Some(key) = start_key {
+            if let Ok(start) = fetch_coding_plan_usage(&client, &key).await {
+                match &mut coding {
+                    Some(c) => c.items.extend(start.items),
+                    None => coding = Some(start),
                 }
             }
         }
@@ -401,10 +398,10 @@ fn parse_mcp_usage(value: &Value) -> Option<CodingPlanSnapshot> {
     let remaining = usage.get("remaining")?.as_f64()?;
     
     let plan_name = match level {
-        "lite" => "GLM Coding Lite",
-        "pro" => "GLM Coding Pro",
-        "max" => "GLM Coding Max",
-        _ => "GLM Coding",
+        "lite" => "个人套餐 Lite",
+        "pro" => "个人套餐 Pro",
+        "max" => "个人套餐 Max",
+        _ => "个人套餐",
     };
     
     Some(CodingPlanSnapshot {
