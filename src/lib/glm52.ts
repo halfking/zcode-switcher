@@ -5,6 +5,8 @@ import type { BalanceItem, ProfileView, QuotaInfo } from "./api";
 export const MONITORED_MODELS = ["glm-5.3", "glm-5.3-flash"] as const;
 
 function isMonitoredBalance(item: BalanceItem): boolean {
+  // 积分制条目（GLM Coding 个人套餐）与 token 阈值不同量纲，不参与切换判定。
+  if (item.unit_type === "point") return false;
   const name = item.show_name.trim().toLowerCase();
   return MONITORED_MODELS.some((model) => name.includes(model));
 }

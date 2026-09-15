@@ -30,6 +30,8 @@ export function QuotaBar({ item, compact = false }: Props) {
   const remainingPct =
     total > 0 ? Math.min(100, Math.max(0, (remaining / total) * 100)) : 0;
   const color = colorFor(remainingPct);
+  // 积分制套餐（GLM Coding 个人套餐）：单位是积分而非 token，展示时带单位。
+  const unit = item.unit_type === "point" ? " 积分" : "";
 
   if (compact) {
     // 紧凑模式：单行，名称弹性截断，进度条细，剩余值在右
@@ -49,6 +51,7 @@ export function QuotaBar({ item, compact = false }: Props) {
         </div>
         <span className="shrink-0 font-mono text-[9px] leading-none text-text-muted">
           {fmt(remaining)}
+          {unit}
         </span>
       </div>
     );
@@ -66,7 +69,9 @@ export function QuotaBar({ item, compact = false }: Props) {
         />
       </div>
       <span className="w-36 shrink-0 text-right font-mono text-[11px] text-text-muted">
-        {fmt(remaining)} / {fmt(total)}
+        {fmt(remaining)}
+        {unit} / {fmt(total)}
+        {unit}
       </span>
     </div>
   );

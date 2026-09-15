@@ -364,12 +364,17 @@ fn quota_probe_cli() -> i32 {
             println!("状态: {:?}", info.plan_status);
             println!("额度条目 ({}):", info.balances.len());
             for item in &info.balances {
+                let tag = match (item.period.as_deref(), item.unit_type.as_deref()) {
+                    (Some(period), _) => period.to_string(),
+                    (None, Some("point")) => "积分".to_string(),
+                    _ => "-".to_string(),
+                };
                 println!(
                     "  - {:<16} 剩余 {:>10.0} / {:>10.0} ({})",
                     item.show_name,
                     item.remaining_units,
                     item.total_units,
-                    item.period.as_deref().unwrap_or("-")
+                    tag
                 );
             }
             if info.balances.is_empty() {
