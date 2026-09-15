@@ -32,6 +32,19 @@ export interface BalanceItem {
   remaining_units: number;
   unit_type: string | null;
   period: string | null;
+  /** 条目所属套餐的 plan_id（个人套餐积分组为 "personal:glm-coding"）。 */
+  plan_id?: string | null;
+}
+
+/** 账号名下的一个套餐摘要（QuotaInfo.plans 条目，用于分组展示）。 */
+export interface PlanSummary {
+  plan_id: string | null;
+  name: string;
+  status: string | null;
+  /** 套餐到期时间（Unix 秒，null 表示无/未知） */
+  ends_at: number | null;
+  /** 是否为 ZCode 当前选中的供应者对应的套餐。 */
+  is_current: boolean;
 }
 
 /** 一个账号的订阅/额度汇总。 */
@@ -42,6 +55,8 @@ export interface QuotaInfo {
   /** 套餐到期时间（Unix 秒，null 表示无） */
   plan_ends_at: number | null;
   balances: BalanceItem[];
+  /** 账号名下所有套餐（billing + 个人套餐积分组），供按套餐分组展示。 */
+  plans?: PlanSummary[];
   /** ZCode 当前选中的模型供应者（如 "coding-plan:builtin:bigmodel-start-plan"），
    *  用于标记"使用中"的套餐条目；null 表示读不到。 */
   active_provider?: string | null;

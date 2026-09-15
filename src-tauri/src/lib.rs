@@ -366,6 +366,17 @@ fn quota_probe_cli() -> i32 {
                 "当前供应者: {}",
                 info.active_provider.as_deref().unwrap_or("(未知)")
             );
+            if !info.plans.is_empty() {
+                println!("套餐列表:");
+                for plan in &info.plans {
+                    println!(
+                        "  - {}{} 状态: {}",
+                        plan.name,
+                        if plan.is_current { " [使用中]" } else { "" },
+                        plan.status.as_deref().unwrap_or("-")
+                    );
+                }
+            }
             println!("额度条目 ({}):", info.balances.len());
             for item in &info.balances {
                 let tag = match (item.period.as_deref(), item.unit_type.as_deref()) {

@@ -1,4 +1,4 @@
-import type { BalanceItem, ProfileView, QuotaInfo } from "./api";
+import type { BalanceItem, PlanSummary, ProfileView, QuotaInfo } from "./api";
 
 // 监听的模型：按 show_name（忽略大小写）子串匹配账号的额度条目。
 // "glm-5.3-flash" 本身包含 "glm-5.3"，显式列出以表达两个监听对象。
@@ -18,22 +18,79 @@ export function monitoredBalances(quota?: QuotaInfo): BalanceItem[] {
 /**
  * 判断额度条目是否属于 ZCode 当前选中的供应者（用于"使用中"标记）。
  *
- * active_provider 形如 "coding-plan:builtin:bigmodel-start-plan"：
- * - 积分条目（unit_type=point，个人套餐）→ 命中 coding-plan 供应者；
- * - token 条目按 show_name 的套餐短名前缀匹配（Start·/Coding·）。
- * Global Build 等桌面端无对应供应者的套餐不参与标记。
+ * active_provider（selectedKey）形如 "coding-plan:builtin:bigmodel-start-plan"：
+ * 前缀 "coding-plan:" 是 key 类型，真正的供应者在最后一段，必须取最后一段
+ * 匹配，否则 start-plan 的 key 会被误判成 coding-plan。
  */
 export function isBalanceActive(
   item: BalanceItem,
   activeProvider?: string | null
 ): boolean {
   if (!activeProvider) return false;
-  const provider = activeProvider.toLowerCase();
-  if (item.unit_type === "point") return provider.includes("coding-plan");
+  const providerId = activeProvider.split(":").pop() ?? "";
+  if (!providerId) return false;
+  if (item.unit_type === "point") {
+    return providerId.includes("bigmodel-coding-plan");
+  }
   const name = item.show_name.trim().toLowerCase();
-  if (name.startsWith("start·")) return provider.includes("start-plan");
-  if (name.startsWith("coding·")) return provider.includes("coding-plan");
+  if (name.startsWith("start·")) return providerId.includes("bigmodel-start-plan");
+  if (name.startsWith("coding·")) return providerId.includes("bigmodel-coding-plan");
   return false;
+}
+
+/**
+ * 判断套餐是否为当前选中的供应者对应的套餐（与后端 plan_is_current 同语义）。
+ * 后端已填 is_current；此函数用于旧缓存等后端字段缺失时的兜底判断。
+ *
+ * 用套餐名匹配而非 plan_id：Global Build 的 plan_id 也挂在 start-plan
+ * 体系下（zcode-v3-start-plan-0914），按 id 匹配会把 Global Build 误标。
+ */
+export function isPlanCurrent(
+  plan: PlanSummary,
+  activeProvider?: string | null
+): boolean {
+  if (!activeProvider) return false;
+  const providerId = activeProvider.split(":").pop() ?? "";
+  if (!providerId) return false;
+  const name = plan.name.toLowerCase();
+  const planId = (plan.plan_id ?? "").toLowerCase();
+  if (providerId.includes("bigmodel-start-plan")) {
+    if (name) return name.includes("start") && !name.includes("global");
+    return planId.includes("start-plan") && !planId.includes("global");
+  }
+  if (providerId.includes("bigmodel-coding-plan")) {
+    if (name) return name.includes("coding");
+    return planId.startsWith("personal:") || planId.includes("coding");
+  }
+  return false;
+}
+
+export interface PlanBalanceGroup {
+  plan: PlanSummary | null;
+  items: BalanceItem[];
+}
+
+/**
+ * 把余额条目按套餐分组：plans[] 顺序为准，条目按 plan_id 归组；
+ * 没有 plan_id 或不在 plans 列表的条目归入末尾的杂项目（plan=null）。
+ * 用于展开视图的"套餐 → 余额"分组展示。
+ */
+export function groupBalancesByPlan(quota: QuotaInfo): PlanBalanceGroup[] {
+  const groups: PlanBalanceGroup[] = [];
+  const byPlanId = new Map<string, PlanBalanceGroup>();
+  for (const plan of quota.plans ?? []) {
+    const group: PlanBalanceGroup = { plan, items: [] };
+    groups.push(group);
+    if (plan.plan_id) byPlanId.set(plan.plan_id, group);
+  }
+  const misc: PlanBalanceGroup = { plan: null, items: [] };
+  for (const item of quota.balances ?? []) {
+    const group = item.plan_id ? byPlanId.get(item.plan_id) : undefined;
+    (group ?? misc).items.push(item);
+  }
+  if (misc.items.length > 0) groups.push(misc);
+  // 空套餐组（无任何条目）也保留：让用户看到套餐存在但服务端暂无额度明细。
+  return groups;
 }
 
 function balanceRemaining(item: BalanceItem): number {

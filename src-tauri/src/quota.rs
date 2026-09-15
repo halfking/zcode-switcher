@@ -27,6 +27,27 @@ pub struct BalanceItem {
     pub unit_type: Option<String>,
     #[serde(default)]
     pub period: Option<String>,
+    /// 条目所属套餐的 plan_id（billing 桶带原值；个人套餐积分桶为
+    /// "personal:glm-coding"）。前端据此把条目归组到 plans[] 里的套餐。
+    #[serde(default)]
+    pub plan_id: Option<String>,
+}
+
+/// 账号名下的一个套餐摘要（plans[] 条目，前端按此分组展示余额）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PlanSummary {
+    /// billing 体系套餐的 plan_id；个人套餐积分组的合成 id 为
+    /// "personal:glm-coding"。
+    pub plan_id: Option<String>,
+    pub name: String,
+    pub status: Option<String>,
+    /// 套餐到期时间（Unix 秒，None 表示无/未知）
+    pub ends_at: Option<f64>,
+    /// 套餐优先级（服务端排序依据，主展示套餐取最高者）
+    #[serde(default)]
+    pub priority: i64,
+    /// 是否为 ZCode 当前选中的供应者对应的套餐（组头"使用中"标记）。
+    pub is_current: bool,
 }
 
 /// 一个账号的订阅/额度汇总（传给前端）。
@@ -38,6 +59,9 @@ pub struct QuotaInfo {
     /// 套餐到期时间（Unix 秒，0 表示无）
     pub plan_ends_at: Option<f64>,
     pub balances: Vec<BalanceItem>,
+    /// 账号名下所有套餐（billing 体系 + 个人套餐积分组），供前端分组。
+    #[serde(default)]
+    pub plans: Vec<PlanSummary>,
     /// ZCode 当前选中的模型供应者（setting.json 的
     /// modelProviderFamilySelectedKeys.bigmodel，如
     /// "coding-plan:builtin:bigmodel-start-plan"）。前端据此标记
@@ -135,7 +159,7 @@ pub async fn fetch_quota(creds_text: &str) -> Result<QuotaInfo, String> {
         }
     }
 
-    let (plan_parts, mut balances) = match balance {
+    let (plan_parts, mut balances, mut plan_summaries) = match balance {
         Some(balance) => {
             // plan_id → 套餐名映射：同名模型条目可能来自多个同时生效的套餐
             // （如 Global Build 与 Start Plan 各有一个 GLM-5.3-Flash 桶），
@@ -158,18 +182,59 @@ pub async fn fetch_quota(creds_text: &str) -> Result<QuotaInfo, String> {
                 .into_iter()
                 .filter_map(|v| parse_balance_item(v, &plan_names))
                 .collect();
-            (Some(pick_best_plan(balance.plans)), balances)
+            // 全部套餐摘要（不止 priority 最高的那个），供前端分组展示。
+            let summaries: Vec<PlanSummary> = balance
+                .plans
+                .into_iter()
+                .filter(|p| p.name.is_some() || p.plan_id.is_some())
+                .map(|p| PlanSummary {
+                    plan_id: p.plan_id,
+                    name: p.name.unwrap_or_default(),
+                    status: p.status,
+                    ends_at: p.ends_at.filter(|v| *v > 0.0),
+                    priority: p.priority.unwrap_or(0),
+                    is_current: false,
+                })
+                .collect();
+            (Some(pick_best_plan_parts(&summaries)), balances, summaries)
         }
-        None => (None, Vec::new()),
+        None => (None, Vec::new(), Vec::new()),
     };
-    if let Some(snapshot) = &coding {
+    // 个人套餐积分组：合成 plan_id 并加入套餐列表，前端按组展示。
+    if let Some(snapshot) = &mut coding {
+        let personal_plan_id = "personal:glm-coding".to_string();
+        for item in &mut snapshot.items {
+            item.plan_id = Some(personal_plan_id.clone());
+        }
         balances.extend(snapshot.items.iter().cloned());
+        plan_summaries.push(PlanSummary {
+            plan_id: Some(personal_plan_id),
+            name: coding_plan_display_name(&snapshot.level),
+            status: Some("active".into()),
+            ends_at: None,
+            priority: i64::MAX,
+            is_current: false,
+        });
     }
     if balances.is_empty() {
         return Err(match billing_error {
             Some(e) => format!("套餐额度刷新失败：{}", friendly_balance_error(Some(&e))),
             None => "额度接口未返回可显示的模型额度明细".into(),
         });
+    }
+
+    let active_provider = read_active_bigmodel_provider();
+    // 标记当前使用中的套餐。selectedKey 形如
+    // "coding-plan:builtin:bigmodel-start-plan"——前缀 "coding-plan:" 是
+    // key 类型，真正的供应者在最后一段，必须用最后一段匹配，否则
+    // start-plan 的 key 会被误判成 coding-plan。
+    let selected_provider_id = active_provider
+        .as_deref()
+        .and_then(|key| key.rsplit(':').next())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    for plan in &mut plan_summaries {
+        plan.is_current = plan_is_current(plan, &selected_provider_id);
     }
 
     let (mut plan_name, plan_description, plan_status, plan_ends_at) =
@@ -187,8 +252,51 @@ pub async fn fetch_quota(creds_text: &str) -> Result<QuotaInfo, String> {
         plan_status,
         plan_ends_at,
         balances,
-        active_provider: read_active_bigmodel_provider(),
+        plans: plan_summaries,
+        active_provider,
     })
+}
+
+/// 判断套餐是否为当前选中供应者对应的套餐。
+/// selected_provider_id 是 selectedKey 的最后一段（如
+/// "builtin:bigmodel-start-plan"）。
+///
+/// 用套餐名匹配而非 plan_id：Global Build 的 plan_id 也挂在 start-plan
+/// 体系下（zcode-v3-start-plan-0914，仅日期后缀不同），按 id 匹配会把
+/// Global Build 误标为使用中；名字（"ZCode Start Plan" vs
+/// "ZCode Global Build"）才是可靠区分。
+fn plan_is_current(plan: &PlanSummary, selected_provider_id: &str) -> bool {
+    if selected_provider_id.is_empty() {
+        return false;
+    }
+    let name = plan.name.to_ascii_lowercase();
+    let plan_id = plan.plan_id.as_deref().unwrap_or("").to_ascii_lowercase();
+    if selected_provider_id.contains("bigmodel-start-plan") {
+        if !name.is_empty() {
+            return name.contains("start") && !name.contains("global");
+        }
+        // 名字缺失时的 id 回退：Global Build 与 Start Plan 的 id 同挂
+        // start-plan 体系（仅日期后缀不同），无法区分，保守不标记。
+        return false;
+    }
+    if selected_provider_id.contains("bigmodel-coding-plan") {
+        if !name.is_empty() {
+            return name.contains("coding");
+        }
+        return plan_id.starts_with("personal:") || plan_id.contains("coding");
+    }
+    false
+}
+
+/// 从套餐摘要列表里选主展示套餐（priority 最高者，与原 pick_best_plan 一致）。
+fn pick_best_plan_parts(
+    summaries: &[PlanSummary],
+) -> (Option<String>, Option<String>, Option<String>, Option<f64>) {
+    let best = summaries.iter().max_by_key(|p| p.priority);
+    match best {
+        Some(p) => (Some(p.name.clone()), None, p.status.clone(), p.ends_at),
+        None => (None, None, None, None),
+    }
 }
 
 /// 读取 ZCode setting.json 里 bigmodel 家族当前选中的供应者
@@ -348,6 +456,7 @@ fn parse_coding_plan_usage(value: &Value) -> Option<CodingPlanSnapshot> {
                 (6, 1) => Some("weekly".into()),
                 _ => None,
             },
+            plan_id: None,
         });
     }
     if items.is_empty() {
@@ -479,6 +588,7 @@ fn parse_mcp_usage(value: &Value) -> Option<CodingPlanSnapshot> {
             remaining_units: remaining,
             unit_type: Some("point".into()),
             period: None,
+            plan_id: None,
         }],
     })
 }
@@ -525,6 +635,7 @@ fn parse_balance_item(
     // Start·GLM-5.3-Flash），用套餐短名前缀区分；个人套餐积分条目
     // （mcp/usage 来的）没有 plan_id，保持原样。
     if let Some(plan_id) = value.get("plan_id").and_then(Value::as_str) {
+        item.plan_id = Some(plan_id.to_string());
         if let Some(plan_name) = plan_names.get(plan_id) {
             let short = plan_short_name(plan_name);
             if !item.show_name.starts_with(&format!("{short}·")) {
@@ -909,6 +1020,113 @@ mod tests {
     }
 
     #[test]
+    fn plan_is_current_matches_provider_tail_not_key_prefix() {
+        // selectedKey = "coding-plan:builtin:bigmodel-start-plan"：前缀
+        // "coding-plan:" 是 key 类型，真正的供应者在最后一段。用整串
+        // contains 判断会把 start-plan 误判成 coding-plan（回归防护）。
+        // 另注意 Global Build 的 plan_id 也挂在 start-plan 体系下
+        // （zcode-v3-start-plan-0914），必须按名字区分。
+        let start_tail = "builtin:bigmodel-start-plan";
+        let coding_tail = "builtin:bigmodel-coding-plan";
+        let make = |name: &str, plan_id: &str| PlanSummary {
+            plan_id: Some(plan_id.into()),
+            name: name.into(),
+            status: None,
+            ends_at: None,
+            priority: 0,
+            is_current: false,
+        };
+
+        // Start Plan 供应者选中时：Start Plan 命中；Global Build 与
+        // personal 积分组不命中（名字/id 均不含 start 或明确含 global）。
+        assert!(plan_is_current(&make("ZCode Start Plan", "zcode-v3-start-plan-0817"), start_tail));
+        assert!(!plan_is_current(
+            &make("ZCode Global Build", "zcode-v3-start-plan-0914"),
+            start_tail
+        ));
+        assert!(!plan_is_current(&make("GLM Coding Lite", "personal:glm-coding"), start_tail));
+
+        // Coding Plan 供应者选中时：个人套餐组命中，start 不命中
+        assert!(plan_is_current(&make("GLM Coding Lite", "personal:glm-coding"), coding_tail));
+        assert!(!plan_is_current(&make("ZCode Start Plan", "zcode-v3-start-plan-0817"), coding_tail));
+
+        // 名字缺失时 id 无法区分 Global/Start（同挂 start-plan 体系），不标记
+        assert!(!plan_is_current(&make("", "zcode-v3-start-plan-0817"), start_tail));
+        assert!(!plan_is_current(&make("", "zcode-v3-start-plan-0914"), start_tail));
+
+        // 空 selectedKey 一律不命中
+        assert!(!plan_is_current(&make("ZCode Start Plan", "zcode-v3-start-plan-0817"), ""));
+    }
+
+    #[test]
+    fn personal_coding_group_joins_plans_with_current_flag() {
+        // 端到端构造：billing 两个套餐 + 个人套餐积分组，选中 start-plan。
+        // 注意 Global Build 的 plan_id 与 Start Plan 同挂 start-plan 体系
+        // （真实数据：zcode-v3-start-plan-0914），靠名字区分。
+        let data: BillingBalanceData = serde_json::from_value(json!({
+            "plans": [
+                {"plan_id": "zcode-v3-start-plan-0914", "name": "ZCode Global Build",
+                 "priority": 200, "status": "active"},
+                {"plan_id": "zcode-v3-start-plan-0817", "name": "ZCode Start Plan",
+                 "priority": 90, "status": "active"}
+            ],
+            "balances": [
+                {"plan_id": "zcode-v3-start-plan-0914", "show_name": "GLM-5.3-Flash",
+                 "total_units": 100000000, "used_units": 0, "remaining_units": 100000000}
+            ]
+        }))
+        .unwrap();
+        let plan_names: std::collections::HashMap<String, String> = data
+            .plans
+            .iter()
+            .filter_map(|p| {
+                p.plan_id
+                    .clone()
+                    .zip(p.name.clone())
+                    .map(|(id, name)| (id, name))
+            })
+            .collect();
+        let mut summaries: Vec<PlanSummary> = data
+            .plans
+            .into_iter()
+            .map(|p| PlanSummary {
+                plan_id: p.plan_id,
+                name: p.name.unwrap_or_default(),
+                status: p.status,
+                ends_at: p.ends_at.filter(|v| *v > 0.0),
+                priority: p.priority.unwrap_or(0),
+                is_current: false,
+            })
+            .collect();
+        let _ = parse_balance_item(
+            data.balances.into_iter().next().unwrap(),
+            &plan_names,
+        )
+        .unwrap();
+        summaries.push(PlanSummary {
+            plan_id: Some("personal:glm-coding".into()),
+            name: "GLM Coding Lite".into(),
+            status: Some("active".into()),
+            ends_at: None,
+            priority: i64::MAX,
+            is_current: false,
+        });
+        let selected = "builtin:bigmodel-start-plan";
+        for plan in &mut summaries {
+            plan.is_current = plan_is_current(plan, selected);
+        }
+        assert_eq!(summaries.len(), 3);
+        assert_eq!(
+            summaries
+                .iter()
+                .filter(|p| p.is_current)
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ZCode Start Plan"]
+        );
+    }
+
+    #[test]
     fn parse_coding_plan_keeps_returned_quota_items() {
         let data: BillingBalanceData = serde_json::from_value(json!({
             "plans": [{
@@ -1092,4 +1310,3 @@ mod tests {
         assert!(!info.balances.is_empty(), "balances 不应为空");
     }
 }
-

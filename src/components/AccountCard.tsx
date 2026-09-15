@@ -12,7 +12,7 @@ import {
 import type { ProfileView, QuotaInfo } from "../lib/api";
 import { gradientFor, initialOf } from "../lib/avatar";
 import { QuotaBar } from "./QuotaBar";
-import { isBalanceActive } from "../lib/glm52";
+import { groupBalancesByPlan, isBalanceActive, isPlanCurrent } from "../lib/glm52";
 import { formatText, getTexts, type Language } from "../i18n";
 
 interface Props {
@@ -514,14 +514,56 @@ function AccountCard({
             isListView ? "pt-2" : "pt-3"
           }`}
         >
-          {quota!.balances.slice(0, isListView ? 2 : 4).map((b, i) => (
-            <QuotaBar
-              key={`${b.show_name}-${i}`}
-              item={b}
-              active={isBalanceActive(b, quota?.active_provider)}
-              activeLabel={t.quotaInUse}
-            />
-          ))}
+          {(() => {
+            const groups = groupBalancesByPlan(quota!);
+            // 单套餐账号组头与卡片头部的套餐名重复，仅多套餐时展示分组。
+            const showGroupHeaders =
+              groups.filter((g) => g.plan).length > 1;
+            return groups.map((group, gi) => {
+              const plan = group.plan;
+              const current = plan
+                ? (plan.is_current ||
+                    isPlanCurrent(plan, quota?.active_provider))
+                : false;
+              const items = group.items.slice(0, isListView ? 2 : 4);
+              if (!plan && items.length === 0) return null;
+              return (
+                <div
+                  key={plan?.plan_id ?? `misc-${gi}`}
+                  className="flex flex-col gap-1"
+                >
+                  {plan && showGroupHeaders && (
+                    <div className="flex min-w-0 items-center gap-1.5">
+                      <span
+                        className="truncate text-[10px] font-semibold text-text-secondary"
+                        title={plan.name}
+                      >
+                        {plan.name}
+                      </span>
+                      {current && (
+                        <span className="shrink-0 rounded bg-ok/15 px-1 py-px text-[9px] font-semibold leading-4 text-ok">
+                          {t.quotaInUse}
+                        </span>
+                      )}
+                      {plan.status && plan.status !== "active" && (
+                        <span className="shrink-0 text-[9px] text-text-muted">
+                          {plan.status}
+                        </span>
+                      )}
+                    </div>
+                  )}
+                  {items.map((b, i) => (
+                    <QuotaBar
+                      key={`${b.show_name}-${i}`}
+                      item={b}
+                      active={current && isBalanceActive(b, quota?.active_provider)}
+                      activeLabel={t.quotaInUse}
+                    />
+                  ))}
+                </div>
+              );
+            });
+          })()}
           {showQuotaLoading ? (
             <div className="text-[11px] font-medium text-text-secondary">
               {t.quotaLoadingLabel}
