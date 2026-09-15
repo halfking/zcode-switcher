@@ -12,6 +12,12 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+# 本地/发布构建优化：LTO 跨 crate 内联去重，单 codegen unit 换最大优化，strip 去掉符号表。
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
