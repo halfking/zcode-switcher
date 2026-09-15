@@ -12,7 +12,12 @@ import {
 import type { ProfileView, QuotaInfo } from "../lib/api";
 import { gradientFor, initialOf } from "../lib/avatar";
 import { QuotaBar } from "./QuotaBar";
-import { groupBalancesByPlan, isBalanceActive, isPlanCurrent } from "../lib/glm52";
+import {
+  groupBalancesByPlan,
+  isBalanceActive,
+  isPlanCurrent,
+  stripPlanPrefix,
+} from "../lib/glm52";
 import { formatText, getTexts, type Language } from "../i18n";
 
 interface Props {
@@ -226,20 +231,49 @@ function AccountCard({
           </div>
         </div>
 
-        {/* 中部：额度区，缺数据画骨架 */}
+        {/* 中部：额度区，缺数据画骨架。按套餐分组展示全部条目。 */}
         <div className="mt-3 flex min-h-0 flex-col gap-1.5 overflow-hidden border-t border-base-border/70 pt-2.5">
           {hasQuotaBars
-            ? quota!.balances
-                .slice(0, 2)
-                .map((b, i) => (
-                  <QuotaBar
-                    key={`${b.show_name}-${i}`}
-                    item={b}
-                    compact
-                    active={isBalanceActive(b, quota?.active_provider)}
-                    activeLabel={t.quotaInUse}
-                  />
-                ))
+            ? groupBalancesByPlan(quota!).map((group, gi) => {
+                const plan = group.plan;
+                if (!plan && group.items.length === 0) return null;
+                const current = plan
+                  ? plan.is_current ||
+                    isPlanCurrent(plan, quota?.active_provider)
+                  : false;
+                const items = group.items.slice(0, 6);
+                return (
+                  <div
+                    key={plan?.plan_id ?? `misc-${gi}`}
+                    className="flex flex-col gap-1"
+                  >
+                    {plan && (
+                      <div className="flex min-w-0 items-center gap-1">
+                        <span
+                          className="truncate text-[9px] font-semibold uppercase tracking-wide text-text-muted"
+                          title={plan.name}
+                        >
+                          {plan.name}
+                        </span>
+                        {current && (
+                          <span className="shrink-0 rounded bg-ok/15 px-1 text-[8px] font-semibold leading-4 text-ok">
+                            {t.quotaCurrentPlan}
+                          </span>
+                        )}
+                      </div>
+                    )}
+                    {items.map((b, i) => (
+                      <QuotaBar
+                        key={`${b.show_name}-${i}`}
+                        item={{ ...b, show_name: stripPlanPrefix(b.show_name) }}
+                        compact
+                        active={current}
+                        activeLabel={t.quotaCurrentPlan}
+                      />
+                    ))}
+                  </div>
+                );
+              })
             : [0, 1].map((i) => (
                 <div key={i} className="flex min-w-0 items-center gap-1.5">
                   <span className="w-16 shrink-0 truncate text-[10px] font-medium text-text-muted">
@@ -555,9 +589,9 @@ function AccountCard({
                   {items.map((b, i) => (
                     <QuotaBar
                       key={`${b.show_name}-${i}`}
-                      item={b}
+                      item={{ ...b, show_name: stripPlanPrefix(b.show_name) }}
                       active={current && isBalanceActive(b, quota?.active_provider)}
-                      activeLabel={t.quotaInUse}
+                      activeLabel={t.quotaCurrentPlan}
                     />
                   ))}
                 </div>

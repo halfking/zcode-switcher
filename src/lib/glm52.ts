@@ -70,6 +70,11 @@ export interface PlanBalanceGroup {
   items: BalanceItem[];
 }
 
+/** 去掉余额条目名里的套餐短名前缀（组头已显示套餐名，条目名无需重复）。 */
+export function stripPlanPrefix(name: string): string {
+  return name.replace(/^(global|start|coding|team)·/i, "");
+}
+
 /**
  * 把余额条目按套餐分组：plans[] 顺序为准，条目按 plan_id 归组；
  * 没有 plan_id 或不在 plans 列表的条目归入末尾的杂项目（plan=null）。
