@@ -107,7 +107,16 @@ fn local_provider_value(base_url: &str, gateway_key: &str) -> Value {
         "enabled": true,
         "source": "custom",
         "models": {
-            "GLM-5.2": {
+            "GLM-5.3": {
+                "limit": {
+                    "context": 1000000
+                },
+                "modalities": {
+                    "input": ["text"],
+                    "output": ["text"]
+                }
+            },
+            "GLM-5.3-Flash": {
                 "limit": {
                     "context": 1000000
                 },
@@ -255,7 +264,7 @@ fn anthropic_to_openai_body(request: &Value) -> Value {
             .and_then(Value::as_str)
             .map(normalize_model_id)
             .map(|model| Value::String(model.to_string()))
-            .unwrap_or_else(|| Value::String("glm-5.2".into())),
+            .unwrap_or_else(|| Value::String("glm-5.3".into())),
         "messages": messages,
         "stream": request.get("stream").cloned().unwrap_or(Value::Bool(false)),
     });
@@ -275,6 +284,8 @@ fn normalize_model_id(model: &str) -> &str {
 fn normalize_zcode_model(model: &str) -> String {
     let model = normalize_model_id(model);
     match model.to_ascii_lowercase().as_str() {
+        "glm-5.3" => "GLM-5.3".to_string(),
+        "glm-5.3-flash" => "GLM-5.3-Flash".to_string(),
         "glm-5.2" => "GLM-5.2".to_string(),
         "glm-5-turbo" | "glm-turbo" => "GLM-5-Turbo".to_string(),
         "glm-5.1" => "GLM-5.1".to_string(),
@@ -478,9 +489,15 @@ async fn models(
         .is_empty()
     {
         data.push(ModelItem {
-            id: "glm-5.2".into(),
+            id: "glm-5.3".into(),
             item_type: "model",
-            display_name: "GLM-5.2".into(),
+            display_name: "GLM-5.3".into(),
+            provider: "ZCode account pool".into(),
+        });
+        data.push(ModelItem {
+            id: "glm-5.3-flash".into(),
+            item_type: "model",
+            display_name: "GLM-5.3-Flash".into(),
             provider: "ZCode account pool".into(),
         });
     }

@@ -20,6 +20,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { check as checkUpdate } from "@tauri-apps/plugin-updater";
 import { useStore } from "./store";
 import { api, type CurrentStatus } from "./lib/api";
+import { dynamicQuotaRefreshIntervalMs, glm52Remaining } from "./lib/glm52";
 import { LogicalSize, getCurrentWindow } from "@tauri-apps/api/window";
 import { LANGUAGES, formatText, getTexts } from "./i18n";
 import zcodeLogo from "./assets/zcode-logo.png";
@@ -282,23 +283,32 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [quotaRefreshIntervalMinutes, scheduledRefreshAllQuota, scheduledRefreshSeq, sortedProfileIds]);
 
+  // 动态间隔：自动切换开启时按当前账号剩余额度取 5s/20s/60s 档位，关闭时用用户配置。
+  const computeActiveRefreshIntervalMs = useCallback(() => {
+    if (!glm52AutoSwitchEnabled) {
+      return activeQuotaRefreshIntervalMinutes * 60 * 1000;
+    }
+    const state = useStore.getState();
+    const active = state.profiles.find((p) => p.active);
+    const remaining = glm52Remaining(active ? state.quotas[active.id] : undefined);
+    return dynamicQuotaRefreshIntervalMs(remaining, state.glm52AutoSwitchThresholdWan);
+  }, [activeQuotaRefreshIntervalMinutes, glm52AutoSwitchEnabled]);
+
+  // 自调度 setTimeout：每次刷新完成后按最新剩余额度重算下一次间隔。
   useEffect(() => {
     if (!activeProfile) return;
-    const intervalMs = glm52AutoSwitchEnabled
-      ? 20 * 1000
-      : activeQuotaRefreshIntervalMinutes * 60 * 1000;
-    activeQuotaRefreshDueAt.current = Date.now() + intervalMs;
-    const timer = window.setInterval(() => {
-      refreshActiveQuotaForAutoSwitch();
+    let timer = 0;
+    const schedule = () => {
+      const intervalMs = computeActiveRefreshIntervalMs();
       activeQuotaRefreshDueAt.current = Date.now() + intervalMs;
-    }, intervalMs);
-    return () => window.clearInterval(timer);
-  }, [
-    activeProfile,
-    activeQuotaRefreshIntervalMinutes,
-    glm52AutoSwitchEnabled,
-    refreshActiveQuotaForAutoSwitch,
-  ]);
+      timer = window.setTimeout(async () => {
+        await refreshActiveQuotaForAutoSwitch();
+        schedule();
+      }, intervalMs);
+    };
+    schedule();
+    return () => window.clearTimeout(timer);
+  }, [activeProfile, computeActiveRefreshIntervalMs, refreshActiveQuotaForAutoSwitch]);
 
   useEffect(() => {
     const refreshIfOverdue = () => {
@@ -317,10 +327,7 @@ export default function App() {
       }
       if (!activeProfile || didBatchRefresh || now < activeQuotaRefreshDueAt.current) return;
       refreshActiveQuotaForAutoSwitch();
-      const intervalMs = glm52AutoSwitchEnabled
-        ? 20 * 1000
-        : activeQuotaRefreshIntervalMinutes * 60 * 1000;
-      activeQuotaRefreshDueAt.current = now + intervalMs;
+      activeQuotaRefreshDueAt.current = now + computeActiveRefreshIntervalMs();
     };
     window.addEventListener("focus", refreshIfOverdue);
     document.addEventListener("visibilitychange", refreshIfOverdue);
@@ -330,8 +337,7 @@ export default function App() {
     };
   }, [
     activeProfile,
-    activeQuotaRefreshIntervalMinutes,
-    glm52AutoSwitchEnabled,
+    computeActiveRefreshIntervalMs,
     quotaRefreshIntervalMinutes,
     scheduledRefreshAllQuota,
     sortedProfileIds,

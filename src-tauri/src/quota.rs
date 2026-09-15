@@ -342,7 +342,7 @@ mod tests {
                 "ends_at": 1783785599
             }],
             "balances": [{
-                "show_name": "GLM-5.2",
+                "show_name": "GLM-5.3",
                 "total_units": 3000000,
                 "used_units": 100000,
                 "remaining_units": 2900000,
@@ -367,7 +367,7 @@ mod tests {
         assert_eq!(status.as_deref(), Some("active"));
         assert_eq!(ends_at, Some(1783785599.0));
         assert_eq!(balances.len(), 2);
-        assert_eq!(balances[0].show_name, "GLM-5.2");
+        assert_eq!(balances[0].show_name, "GLM-5.3");
         assert_eq!(balances[0].remaining_units, 2_900_000.0);
     }
 
@@ -417,7 +417,7 @@ mod tests {
 
     #[test]
     fn parse_logged_balance_payload() {
-        let line = r#"[2026-07-07 08:52:01.399] [info] [usage-stats] billing/balance 请求完成 {"balanceCount":2,"payload":{"code":0,"msg":"","data":{"plans":[{"name":"ZCode Start Plan","priority":100,"status":"active"}],"balances":[{"show_name":"GLM-5.2","total_units":3000000,"used_units":0,"remaining_units":3000000},{"show_name":"GLM-5-Turbo","total_units":2000000,"used_units":0,"remaining_units":2000000}]}}}"#;
+        let line = r#"[2026-07-07 08:52:01.399] [info] [usage-stats] billing/balance 请求完成 {"balanceCount":2,"payload":{"code":0,"msg":"","data":{"plans":[{"name":"ZCode Start Plan","priority":100,"status":"active"}],"balances":[{"show_name":"GLM-5.3","total_units":3000000,"used_units":0,"remaining_units":3000000},{"show_name":"GLM-5-Turbo","total_units":2000000,"used_units":0,"remaining_units":2000000}]}}}"#;
         let data = parse_logged_balance_line(line).unwrap();
         assert_eq!(data.plans.len(), 1);
         assert_eq!(data.balances.len(), 2);

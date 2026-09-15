@@ -1,27 +1,30 @@
 import type { BalanceItem, ProfileView, QuotaInfo } from "./api";
 
-export interface Glm52PoolStats {
-  totalAccounts: number;
-  usedAccounts: number;
-  remainingAccounts: number;
-  usedUnits: number;
-  totalUnits: number;
+// 监听的模型：按 show_name（忽略大小写）子串匹配账号的额度条目。
+// "glm-5.3-flash" 本身包含 "glm-5.3"，显式列出以表达两个监听对象。
+export const MONITORED_MODELS = ["glm-5.3", "glm-5.3-flash"] as const;
+
+function isMonitoredBalance(item: BalanceItem): boolean {
+  const name = item.show_name.trim().toLowerCase();
+  return MONITORED_MODELS.some((model) => name.includes(model));
 }
 
-export function findGlm52Balance(quota?: QuotaInfo): BalanceItem | undefined {
-  return quota?.balances?.find((b) =>
-    b.show_name.trim().toLowerCase().includes("glm-5.2")
-  );
+export function monitoredBalances(quota?: QuotaInfo): BalanceItem[] {
+  return quota?.balances?.filter(isMonitoredBalance) ?? [];
 }
 
+function balanceRemaining(item: BalanceItem): number {
+  if (Number.isFinite(item.remaining_units)) return Math.max(0, item.remaining_units);
+  const total = Number.isFinite(item.total_units) ? Math.max(0, item.total_units) : 0;
+  const used = Number.isFinite(item.used_units) ? Math.max(0, item.used_units) : 0;
+  return Math.max(0, total - used);
+}
+
+// 剩余额度 = 监听模型各额度条目剩余之和；无任何匹配条目时返回 null。
 export function glm52Remaining(quota?: QuotaInfo): number | null {
-  const item = findGlm52Balance(quota);
-  if (!item) return null;
-  if (Number.isFinite(item.remaining_units)) return item.remaining_units;
-  if (Number.isFinite(item.total_units) && Number.isFinite(item.used_units)) {
-    return Math.max(0, item.total_units - item.used_units);
-  }
-  return null;
+  const items = monitoredBalances(quota);
+  if (items.length === 0) return null;
+  return items.reduce((sum, item) => sum + balanceRemaining(item), 0);
 }
 
 export function formatQuotaUnits(n: number): string {
@@ -30,6 +33,32 @@ export function formatQuotaUnits(n: number): string {
   if (abs >= 1e8) return `${(n / 1e8).toFixed(2)} 亿`;
   if (abs >= 1e4) return `${(n / 1e4).toFixed(2)} 万`;
   return Math.round(n).toLocaleString();
+}
+
+// 按剩余额度动态调整监测间隔：越接近切换阈值刷新越快，充裕时放慢轮询。
+export const DYNAMIC_REFRESH_MIN_MS = 5_000;
+export const DYNAMIC_REFRESH_MID_MS = 20_000;
+export const DYNAMIC_REFRESH_MAX_MS = 60_000;
+
+export function dynamicQuotaRefreshIntervalMs(
+  remaining: number | null,
+  thresholdWan: number
+): number {
+  if (remaining === null || !Number.isFinite(remaining)) {
+    return DYNAMIC_REFRESH_MID_MS;
+  }
+  const threshold = Math.max(1, thresholdWan) * 10_000;
+  if (remaining <= threshold) return DYNAMIC_REFRESH_MIN_MS;
+  if (remaining <= threshold * 3) return DYNAMIC_REFRESH_MID_MS;
+  return DYNAMIC_REFRESH_MAX_MS;
+}
+
+export interface Glm52PoolStats {
+  totalAccounts: number;
+  usedAccounts: number;
+  remainingAccounts: number;
+  usedUnits: number;
+  totalUnits: number;
 }
 
 export function computeGlm52PoolStats(
@@ -44,16 +73,18 @@ export function computeGlm52PoolStats(
   let usedBelowThresholdUnits = 0;
 
   for (const profile of profiles) {
-    const item = findGlm52Balance(quotas[profile.id]);
-    if (!item) continue;
+    const items = monitoredBalances(quotas[profile.id]);
+    if (items.length === 0) continue;
 
-    const total = Number.isFinite(item.total_units) ? Math.max(0, item.total_units) : 0;
-    const remaining = Number.isFinite(item.remaining_units)
-      ? Math.max(0, item.remaining_units)
-      : Math.max(0, total - (Number.isFinite(item.used_units) ? item.used_units : 0));
-    const used = Number.isFinite(item.used_units)
-      ? Math.max(0, item.used_units)
-      : Math.max(0, total - remaining);
+    const total = items.reduce(
+      (sum, item) => sum + (Number.isFinite(item.total_units) ? Math.max(0, item.total_units) : 0),
+      0
+    );
+    const remaining = items.reduce((sum, item) => sum + balanceRemaining(item), 0);
+    const used = items.reduce(
+      (sum, item) => sum + (Number.isFinite(item.used_units) ? Math.max(0, item.used_units) : 0),
+      0
+    );
 
     rawTotalUnits += total;
     usedUnits += used;
