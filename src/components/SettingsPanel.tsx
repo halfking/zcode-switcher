@@ -555,7 +555,7 @@ export default function SettingsPanel() {
           <input
             type="number"
             min={10}
-            max={100}
+            max={500}
             step={1}
             value={glm52AutoSwitchThresholdWan}
             onChange={(e) =>
