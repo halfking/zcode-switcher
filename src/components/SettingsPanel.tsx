@@ -367,6 +367,8 @@ export default function SettingsPanel() {
     setGlm52AutoSwitchThresholdWan,
     glm52AutoSwitchPointThreshold,
     setGlm52AutoSwitchPointThreshold,
+    glm52LowQuotaAction,
+    setGlm52LowQuotaAction,
     autoRestart,
     setAutoRestart,
     tryNoRestartSwitch,
@@ -546,6 +548,30 @@ export default function SettingsPanel() {
           on={glm52AutoSwitchEnabled}
           onClick={() => setGlm52AutoSwitchEnabled(!glm52AutoSwitchEnabled)}
         />
+      </Row>
+
+      <Row
+        icon={<Clock size={15} />}
+        title={t.glmLowQuotaActionTitle}
+        desc={
+          glm52LowQuotaAction === "pause"
+            ? t.glmLowQuotaActionDescPause
+            : t.glmLowQuotaActionDescSwitch
+        }
+      >
+        <select
+          value={glm52LowQuotaAction}
+          onChange={(e) =>
+            setGlm52LowQuotaAction(
+              e.currentTarget.value === "pause" ? "pause" : "switch"
+            )
+          }
+          disabled={!glm52AutoSwitchEnabled}
+          className="focus-ring h-8 max-w-44 rounded-lg border border-base-border bg-base-card px-2 text-sm font-semibold text-text-primary outline-none transition hover:bg-base-cardhover disabled:opacity-50"
+        >
+          <option value="switch">{t.glmLowQuotaActionSwitch}</option>
+          <option value="pause">{t.glmLowQuotaActionPause}</option>
+        </select>
       </Row>
 
       <Row

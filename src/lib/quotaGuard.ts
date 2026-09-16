@@ -1,110 +1,128 @@
-import type { BalanceItem, ProfileView, QuotaInfo } from "./api";
+import type { BalanceItem, PlanEntryTarget, QuotaInfo } from "./api";
+import { isAccountLow } from "./glm52";
 
 /**
- * 额度守护：监测 GLM-5.3 / GLM-5.3-Flash 的 5 小时或周余额。
- * 最低剩余百分比低于阈值时，本地网关暂停转发所有请求，保护账号。
+ * 帐号内套餐入口判定。
+ *
+ * ZCode 通过 setting.json 的 modelProviderFamilySelectedKeys[family] 在两个
+ * 套餐入口之间选择消耗哪个套餐（本工具实测结论）：
+ * - `coding-plan:builtin:<family>-start-plan` → Start/Global Plan（token 桶）；
+ * - `coding-plan:builtin:<family>-coding-plan` → GLM Coding Plan（积分桶）。
+ *
+ * 低额度自动切换的顺序因此是：当前入口余额不足 → 先切到同帐号内有余额的
+ * 另一个入口（切套餐）；所有入口都低于阈值 → 才切换帐号；暂停模式则改为
+ * 拦截请求等待人工处理。
  */
-export const GUARD_THRESHOLD_PERCENT = 2;
 
-/** 守护桶：period 为 5h/weekly，或无周期但模型名含 glm-5.3（含 Flash）。 */
-export function isGuardBucket(item: BalanceItem): boolean {
-  const period = item.period?.trim().toLowerCase();
-  if (period) return period === "5h" || period === "weekly";
-  return item.show_name.trim().toLowerCase().includes("glm-5.3");
+/** 余额条目归属的套餐入口；不参与判定的条目（其他模型/工具额度）返回 null。 */
+export function entryOfBalance(item: BalanceItem): PlanEntryTarget | null {
+  if (item.unit_type === "point") return "coding-plan";
+  if (item.unit_type === "tool") return null;
+  const name = item.show_name.trim().toLowerCase();
+  const monitored = ["glm-5.3", "glm-5.3-flash"].some((model) => name.includes(model));
+  return monitored ? "start-plan" : null;
 }
 
-function bucketPercent(item: BalanceItem): number | null {
+export interface EntryHealth {
+  /** 该入口是否有可判定的余额数据（无数据 = 帐号可能不含该套餐）。 */
+  evaluable: boolean;
+  /** evaluable 且剩余低于阈值。 */
+  low: boolean;
+  /** 相对阈值的余量（>1 充足，<=1 危险）；不可评估时为 Infinity。 */
+  headroom: number;
+}
+
+function balanceRemaining(item: BalanceItem): number {
+  if (Number.isFinite(item.remaining_units)) return Math.max(0, item.remaining_units);
   const total = Number.isFinite(item.total_units) ? Math.max(0, item.total_units) : 0;
-  if (total <= 0) return null;
-  const remaining = Number.isFinite(item.remaining_units)
-    ? Math.max(0, item.remaining_units)
-    : Math.max(0, total - (Number.isFinite(item.used_units) ? item.used_units : 0));
-  return Math.min(100, Math.max(0, (remaining / total) * 100));
+  const used = Number.isFinite(item.used_units) ? Math.max(0, item.used_units) : 0;
+  return Math.max(0, total - used);
 }
 
-/** 受监控桶中的最低剩余百分比；无可监控桶时返回 null。 */
-export function minGuardPercent(quota?: QuotaInfo): number | null {
-  let min: number | null = null;
-  for (const item of quota?.balances ?? []) {
-    if (!isGuardBucket(item)) continue;
-    const percent = bucketPercent(item);
-    if (percent === null) continue;
-    if (min === null || percent < min) min = percent;
-  }
-  return min;
+function entryItems(quota: QuotaInfo | undefined, entry: PlanEntryTarget): BalanceItem[] {
+  return (quota?.balances ?? []).filter(
+    (item): item is BalanceItem => entryOfBalance(item) === entry
+  );
 }
 
 /**
- * 自适应检测频度：低于阈值（已暂停）或临近阈值时加快到 1 分钟，
- * 轻度关注时 3 分钟，充裕时放宽到 10 分钟；无数据时尽快补测。
+ * 单个套餐入口的健康状态：
+ * - start-plan 入口（token 量纲）：监控模型（GLM-5.3/5.3-Flash）剩余之和；
+ * - coding-plan 入口（积分量纲）：各积分桶剩余的最小值（最紧窗口决定可用性）。
  */
-export function guardIntervalMs(percent: number | null | undefined): number {
-  if (percent === null || percent === undefined) return 60_000;
-  if (percent < 5) return 60_000;
-  if (percent < 15) return 3 * 60_000;
-  return 10 * 60_000;
-}
-
-export function formatQuotaUnits(n: number): string {
-  if (!Number.isFinite(n)) return "-";
-  const abs = Math.abs(n);
-  if (abs >= 1e8) return `${(n / 1e8).toFixed(2)} 亿`;
-  if (abs >= 1e4) return `${(n / 1e4).toFixed(2)} 万`;
-  return Math.round(n).toLocaleString();
-}
-
-export interface GuardPoolStats {
-  totalAccounts: number;
-  /** 5h/周最低余额已低于守护阈值的账号数 */
-  exhaustedAccounts: number;
-  remainingAccounts: number;
-  usedUnits: number;
-  totalUnits: number;
-}
-
-export function computeGuardPoolStats(
-  profiles: ProfileView[],
-  quotas: Record<string, QuotaInfo>
-): GuardPoolStats {
-  let exhaustedAccounts = 0;
-  let usedUnits = 0;
-  let totalUnits = 0;
-
-  for (const profile of profiles) {
-    const quota = quotas[profile.id];
-    const buckets = (quota?.balances ?? []).filter(isGuardBucket);
-    if (buckets.length === 0) continue;
-
-    let bucketTotal = 0;
-    let bucketUsed = 0;
-    let minPercent: number | null = null;
-    for (const item of buckets) {
-      const total = Number.isFinite(item.total_units) ? Math.max(0, item.total_units) : 0;
-      const remaining = Number.isFinite(item.remaining_units)
-        ? Math.max(0, item.remaining_units)
-        : Math.max(0, total - (Number.isFinite(item.used_units) ? item.used_units : 0));
-      const used = Number.isFinite(item.used_units)
-        ? Math.max(0, item.used_units)
-        : Math.max(0, total - remaining);
-      bucketTotal += total;
-      bucketUsed += used;
-      const percent = bucketPercent(item);
-      if (percent !== null && (minPercent === null || percent < minPercent)) {
-        minPercent = percent;
-      }
-    }
-    usedUnits += bucketUsed;
-    totalUnits += bucketTotal;
-    if (minPercent !== null && minPercent < GUARD_THRESHOLD_PERCENT) {
-      exhaustedAccounts += 1;
-    }
+export function entryHealth(
+  quota: QuotaInfo | undefined,
+  entry: PlanEntryTarget,
+  tokenThresholdWan: number,
+  pointThreshold: number
+): EntryHealth {
+  const items = entryItems(quota, entry);
+  if (items.length === 0) {
+    return { evaluable: false, low: false, headroom: Number.POSITIVE_INFINITY };
   }
-
+  if (entry === "coding-plan") {
+    const min = Math.min(...items.map(balanceRemaining));
+    return {
+      evaluable: true,
+      low: min < pointThreshold,
+      headroom: pointThreshold > 0 ? min / pointThreshold : Number.POSITIVE_INFINITY,
+    };
+  }
+  const sum = items.reduce((acc, item) => acc + balanceRemaining(item), 0);
+  const threshold = tokenThresholdWan * 10_000;
   return {
-    totalAccounts: profiles.length,
-    exhaustedAccounts,
-    remainingAccounts: Math.max(0, profiles.length - exhaustedAccounts),
-    usedUnits,
-    totalUnits,
+    evaluable: true,
+    low: sum < threshold,
+    headroom: threshold > 0 ? sum / threshold : Number.POSITIVE_INFINITY,
   };
+}
+
+/** ZCode 当前选中入口；active_provider 缺失或指向非套餐入口（如 apikey）时为 null。 */
+export function currentPlanEntry(
+  activeProvider: string | null | undefined
+): PlanEntryTarget | null {
+  const providerId = (activeProvider ?? "").split(":").pop() ?? "";
+  if (providerId.includes("-coding-plan")) return "coding-plan";
+  if (providerId.includes("-start-plan")) return "start-plan";
+  return null;
+}
+
+/**
+ * 当前入口是否低于阈值。两类情况回退到整账号判定（token 与积分任一
+ * 量纲低于阈值即视为低）：
+ * 1. 入口无法识别（active_provider 缺失或指向非套餐入口）；
+ * 2. 入口可识别但无该套餐的余额数据（evaluable=false），例如账号只
+ *    订阅了 Coding Plan、却把当前入口设到了 start-plan。这种情况下
+ *    当前入口"没数据=看似充足"会让自动切换失灵，必须回退。
+ */
+export function isCurrentEntryLow(
+  quota: QuotaInfo | undefined,
+  tokenThresholdWan: number,
+  pointThreshold: number
+): boolean {
+  const entry = currentPlanEntry(quota?.active_provider);
+  if (!entry) return isAccountLow(quota, tokenThresholdWan, pointThreshold);
+  const health = entryHealth(quota, entry, tokenThresholdWan, pointThreshold);
+  if (!health.evaluable) return isAccountLow(quota, tokenThresholdWan, pointThreshold);
+  return health.low;
+}
+
+/**
+ * 帐号内可切换到的套餐入口：当前入口之外的另一个入口余额充足时返回它；
+ * 没有（不可评估或同样低于阈值）返回 null —— 此时才允许切换帐号。
+ */
+export function pickPlanSwitchTarget(
+  quota: QuotaInfo | undefined,
+  current: PlanEntryTarget,
+  tokenThresholdWan: number,
+  pointThreshold: number
+): PlanEntryTarget | null {
+  const other: PlanEntryTarget = current === "coding-plan" ? "start-plan" : "coding-plan";
+  const health = entryHealth(quota, other, tokenThresholdWan, pointThreshold);
+  return health.evaluable && !health.low ? other : null;
+}
+
+/** 供展示/日志用：把入口映射为稳定标识（文案由 i18n 负责）。 */
+export function planEntryLabelKey(entry: PlanEntryTarget): "planEntryStart" | "planEntryCoding" {
+  return entry === "coding-plan" ? "planEntryCoding" : "planEntryStart";
 }

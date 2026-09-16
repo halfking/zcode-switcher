@@ -87,6 +87,95 @@ fn proxy_slot() -> &'static Mutex<Option<ProxyRuntime>> {
     PROXY.get_or_init(|| Mutex::new(None))
 }
 
+// --------------------------------------------------------------------------- //
+//  额度守护（暂停模式）：余额低于阈值时拦截网关上的所有模型请求
+//
+//  前端在每次额度刷新后评估"当前入口是否低于阈值"，把结果同步进来；
+//  网关在 /v1/messages 上按标志拦截：非流式返回 HTTP 429（rate_limit_error），
+//  流式返回 200 + SSE error 事件（Agent 侧表现为干净的一次失败，立即停止）。
+//  恢复（额度回升 / 人工切换账号 / 改回切换模式）同样由前端清除标志。
+// --------------------------------------------------------------------------- //
+
+#[derive(Debug, Clone)]
+struct GuardState {
+    paused: bool,
+    reason: String,
+    updated_at: u64,
+}
+
+static QUOTA_GUARD: OnceLock<Mutex<GuardState>> = OnceLock::new();
+
+fn quota_guard_slot() -> &'static Mutex<GuardState> {
+    QUOTA_GUARD.get_or_init(|| {
+        Mutex::new(GuardState {
+            paused: false,
+            reason: String::new(),
+            updated_at: 0,
+        })
+    })
+}
+
+/// 额度守护状态（返回给前端展示）。
+#[derive(Debug, Clone, Serialize)]
+pub struct QuotaGuardStatus {
+    pub paused: bool,
+    pub reason: Option<String>,
+    pub updated_at: u64,
+}
+
+fn guard_status(state: &GuardState) -> QuotaGuardStatus {
+    QuotaGuardStatus {
+        paused: state.paused,
+        reason: if state.paused && !state.reason.is_empty() {
+            Some(state.reason.clone())
+        } else {
+            None
+        },
+        updated_at: state.updated_at,
+    }
+}
+
+fn quota_guard_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn quota_guard_apply(paused: bool, reason: &str) -> QuotaGuardStatus {
+    let mut slot = quota_guard_slot().lock().unwrap_or_else(|e| e.into_inner());
+    // 幂等：相同状态不刷新时间戳，避免前端轮询造成无意义的更新。
+    if slot.paused != paused || (!paused && !slot.reason.is_empty()) {
+        slot.updated_at = quota_guard_now();
+    }
+    slot.paused = paused;
+    slot.reason = if paused { reason.to_string() } else { String::new() };
+    guard_status(&slot)
+}
+
+/// 供守护自测（--guard-selftest）注入状态，与命令走同一存储。
+pub fn quota_guard_set_for_test(paused: bool, reason: &str) -> QuotaGuardStatus {
+    quota_guard_apply(paused, reason)
+}
+
+fn quota_guard_is_paused() -> Option<String> {
+    let slot = quota_guard_slot().lock().unwrap_or_else(|e| e.into_inner());
+    slot.paused.then(|| slot.reason.clone())
+}
+
+/// 前端同步守护判定结果：paused=true 时网关开始拦截请求。
+#[tauri::command]
+pub fn set_quota_guard(paused: bool, reason: String) -> Result<QuotaGuardStatus, String> {
+    Ok(quota_guard_apply(paused, reason.trim()))
+}
+
+/// 查询额度守护当前状态。
+#[tauri::command]
+pub fn quota_guard_status() -> Result<QuotaGuardStatus, String> {
+    let slot = quota_guard_slot().lock().unwrap_or_else(|e| e.into_inner());
+    Ok(guard_status(&slot))
+}
+
 fn status_for(port: u16, running: bool) -> ProxyStatus {
     ProxyStatus {
         running,
@@ -566,6 +655,25 @@ async fn messages(
     body: Bytes,
 ) -> Result<Response, Response> {
     check_gateway_auth(&headers, &config.gateway_key)?;
+    // 额度守护：暂停期间拦截所有模型请求。流式请求回 200 + SSE error 事件
+    //（Agent 侧表现为干净的一次失败并停止），非流式回 HTTP 429。
+    if let Some(reason) = quota_guard_is_paused() {
+        let message = if reason.is_empty() {
+            "额度守护已暂停：账号余额低于阈值，请人工切换账号/套餐或等待额度恢复。".to_string()
+        } else {
+            format!("额度守护已暂停：{}", reason)
+        };
+        let stream = serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|v| v.get("stream").and_then(Value::as_bool))
+            .unwrap_or(false);
+        return Err(provider_error_response(
+            stream,
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            message,
+        ));
+    }
     let request: Value = serde_json::from_slice(&body).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
@@ -821,6 +929,31 @@ fn build_router(config: ProxyConfig) -> Router {
         .layer(cors)
 }
 
+/// 起一个本地网关服务（绑定 127.0.0.1:port），返回 (实际端口, shutdown)。
+/// 不写 ZCode 配置——`start_proxy` 命令与守护自测共用。
+pub async fn serve_on(
+    port: u16,
+    gateway_key: String,
+) -> Result<(u16, oneshot::Sender<()>), String> {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let listener = TcpListener::bind(addr)
+        .await
+        .map_err(|e| format!("本地代理启动失败：{}", e))?;
+    let actual_port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    let (tx, rx) = oneshot::channel::<()>();
+    let config = ProxyConfig {
+        gateway_key: gateway_key.trim().to_string(),
+    };
+    let router = build_router(config);
+    tokio::spawn(async move {
+        let server = axum::serve(listener, router).with_graceful_shutdown(async {
+            let _ = rx.await;
+        });
+        let _ = server.await;
+    });
+    Ok((actual_port, tx))
+}
+
 #[tauri::command]
 pub async fn start_proxy(port: u16, gateway_key: String) -> Result<ProxyStatus, String> {
     if gateway_key.trim().len() < 12 {
@@ -840,24 +973,8 @@ pub async fn start_proxy(port: u16, gateway_key: String) -> Result<ProxyStatus, 
         return Ok(status_for(port, true));
     }
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let listener = TcpListener::bind(addr)
-        .await
-        .map_err(|e| format!("本地代理启动失败：{}", e))?;
-    let actual_port = listener.local_addr().map_err(|e| e.to_string())?.port();
-    let (tx, rx) = oneshot::channel::<()>();
     let gateway_key = gateway_key.trim().to_string();
-    let config = ProxyConfig {
-        gateway_key: gateway_key.clone(),
-    };
-    let router = build_router(config);
-
-    tokio::spawn(async move {
-        let server = axum::serve(listener, router).with_graceful_shutdown(async {
-            let _ = rx.await;
-        });
-        let _ = server.await;
-    });
+    let (actual_port, tx) = serve_on(port, gateway_key.clone()).await?;
 
     let mut slot = proxy_slot().lock().map_err(|_| "代理状态锁异常")?;
     *slot = Some(ProxyRuntime {

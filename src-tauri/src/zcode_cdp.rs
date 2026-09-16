@@ -208,6 +208,118 @@ pub fn schedule_post_switch_refresh() {
     });
 }
 
+/// 自包含 JS：定位渲染层的 settings 服务并更新
+/// `modelProviderFamilySelectedKeys[family]`，返回切换前后值。
+///
+/// 实测（ZCode 3.11.x，CDP Runtime.evaluate）：ZCode 不监听 setting.json 的
+/// 外部修改，直接改文件对运行中的实例无效；只有走渲染层的
+/// `settingService.update({...})`（与 UI 点击同一条路径）才能同时更新内存
+/// 选择并落盘，让请求立即路由到新的套餐入口。
+///
+/// 定位方式：从 React 根 fiber 向下找携带 `settingService`（同时具备
+/// `get`/`update` 方法）的 props/state/context 对象，命中后缓存到
+/// `window.__zcsSettingsRegistry`。找不到返回 {ok:false, err:"service-not-found"}。
+const SET_SELECTED_KEY_SCRIPT: &str = r#"(async (targetKey) => {
+  function findRegistry() {
+    let cached = window.__zcsSettingsRegistry;
+    if (cached && typeof cached.settingService?.update === 'function') return cached;
+    function getAnyFiber() {
+      const cands = [document.body, document.getElementById('root'), document.documentElement];
+      for (const el of cands) {
+        if (!el) continue;
+        const key = Object.keys(el).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactContainer$'));
+        if (key) return el[key];
+      }
+      return null;
+    }
+    const fiber = getAnyFiber();
+    if (!fiber) return null;
+    let cur = fiber;
+    while (cur.return) cur = cur.return;
+    const root = cur;
+    const seen = new WeakSet();
+    const stack = [root];
+    let count = 0;
+    const isSvc = (o) => o && typeof o === 'object' &&
+      o.settingService && typeof o.settingService.update === 'function' &&
+      typeof o.settingService.get === 'function';
+    while (stack.length && count < 300000) {
+      const node = stack.pop();
+      count++;
+      for (const slot of ['memoizedProps', 'memoizedState', 'pendingProps', 'stateNode', 'context']) {
+        const v = node[slot];
+        if (!v) continue;
+        if (isSvc(v)) { window.__zcsSettingsRegistry = v; return v; }
+      }
+      if (node.child) stack.push(node.child);
+      if (node.sibling) stack.push(node.sibling);
+    }
+    return null;
+  }
+  const reg = findRegistry();
+  if (!reg) return { ok: false, err: 'service-not-found' };
+  const svc = reg.settingService;
+  // targetKey 形如 "coding-plan:builtin:bigmodel-start-plan"，family 取
+  // builtin: 与末段 plan 名之间的段。
+  const m = /builtin:([a-z0-9]+)-(start-plan|coding-plan)$/.exec(targetKey || '');
+  if (!m) return { ok: false, err: 'bad-target-key' };
+  const family = m[1];
+  const before = (await svc.get()).modelProviderFamilySelectedKeys ?? {};
+  const next = { ...before, [family]: targetKey };
+  if (before[family] === targetKey) return { ok: true, unchanged: true, before: before[family], after: before[family] };
+  await svc.update({ modelProviderFamilySelectedKeys: next });
+  const after = ((await svc.get()).modelProviderFamilySelectedKeys ?? {})[family];
+  return after === targetKey
+    ? { ok: true, before: before[family], after }
+    : { ok: false, err: 'update-not-applied', before: before[family], after };
+})"#;
+
+/// 通过 CDP 把 ZCode 当前 family 的套餐入口切换为 `selected_key`
+/// （形如 "coding-plan:builtin:bigmodel-start-plan"）。
+///
+/// 成功返回 Ok(new_key)（内存已生效并落盘）；ZCode 未运行 / 无调试端口 /
+/// 找不到服务时返回 Err，调用方应退回“直接写 setting.json”的路径。
+pub async fn try_update_selected_provider(selected_key: &str) -> Result<String, String> {
+    let Some(ws_url) = pick_zcode_page().await else {
+        return Err("ZCode 调试端口不可用".into());
+    };
+    // SET_SELECTED_KEY_SCRIPT 本身就是箭头函数表达式，直接传参调用。
+    let expression = format!(
+        "({})({})",
+        SET_SELECTED_KEY_SCRIPT,
+        serde_json::to_string(selected_key).map_err(|e| e.to_string())?
+    );
+    let text = evaluate(&ws_url, &expression).await?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("解析 CDP 响应失败：{}", e))?;
+    // Runtime.evaluate 的返回结构是：
+    // { "result": { "result": { "type": "object", "value": {...} } } }
+    // 同时兼容少数实现直接把 value 放在第一层 result 下的情况。
+    let outer = value
+        .get("result")
+        .ok_or_else(|| "CDP 响应缺少 result".to_string())?;
+    let result = outer
+        .get("result")
+        .and_then(|r| r.get("value"))
+        .or_else(|| outer.get("value"))
+        .cloned()
+        .ok_or_else(|| "CDP 响应缺少 result.result.value".to_string())?;
+    if result.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(format!(
+            "settingService 更新未生效：{}",
+            result
+                .get("err")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+        ));
+    }
+    result
+        .get("after")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| "CDP 响应缺少 after".to_string())
+}
+
 #[allow(dead_code)]
 pub fn known_plan_ids() -> &'static [&'static str] {
     ZAI_PLAN_IDS

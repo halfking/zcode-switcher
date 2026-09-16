@@ -1323,6 +1323,203 @@ pub fn switch_to(id: String) -> R<Profile> {
     Ok(redact_provider_keys(profile))
 }
 
+// --------------------------------------------------------------------------- //
+//  帐号内套餐切换（Start Plan 入口 ↔ GLM Coding Plan 入口）
+// --------------------------------------------------------------------------- //
+
+/// 套餐入口切换结果。
+#[derive(Debug, Serialize)]
+pub struct PlanSwitchOutcome {
+    /// 切换后选中的完整 selected key。
+    pub selected_key: String,
+    /// true = 已通过 ZCode 渲染层 settingService 实时生效（运行中的 ZCode
+    /// 立即路由到新入口）；false = 只写了 setting.json，需重启 ZCode 生效。
+    pub applied_live: bool,
+}
+
+/// 校验目标入口并构造 selected key。target 只允许两个套餐入口。
+pub fn plan_selected_key(target: &str) -> Result<(String, String), String> {
+    plan_selected_key_for_family(&current_provider_family(), target)
+}
+
+/// 纯函数版：指定 family 构造 selected key（便于单测）。
+fn plan_selected_key_for_family(family: &str, target: &str) -> Result<(String, String), String> {
+    let normalized = target.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "start-plan" | "coding-plan" => Ok((
+            format!("coding-plan:builtin:{}-{}", family, normalized),
+            family.to_string(),
+        )),
+        other => Err(format!(
+            "未知套餐入口：{}（可选 start-plan / coding-plan）",
+            other
+        )),
+    }
+}
+
+/// 当前登录帐号所属的 provider family（"zai" / "bigmodel"）。
+/// credentials 不可读或未识别时兜底 "bigmodel"（主流程与工具生态都在这条线）。
+fn current_provider_family() -> String {
+    let cred_bytes = credentials_file().ok().and_then(|path| fs::read(path).ok());
+    cred_bytes
+        .and_then(|bytes| extract_active_provider_family(&bytes))
+        .unwrap_or_else(|| "bigmodel".to_string())
+}
+
+/// 把 selected key 合并进 setting.json 文本，返回更新后的完整 JSON 字节。
+/// 纯函数（不碰文件系统），便于单测。返回 None 表示无需改动。
+fn merge_selected_provider_key(
+    setting_text: &str,
+    family: &str,
+    selected_key: &str,
+) -> Option<Vec<u8>> {
+    let mut value: Value = match serde_json::from_str(setting_text) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+    let obj = value.as_object_mut()?;
+    let selected = obj
+        .entry("modelProviderFamilySelectedKeys".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let selected_obj = selected.as_object_mut()?;
+    if selected_obj.get(family).and_then(Value::as_str) == Some(selected_key) {
+        return None;
+    }
+    selected_obj.insert(family.to_string(), Value::String(selected_key.to_string()));
+    serde_json::to_vec_pretty(&value).ok()
+}
+
+/// 读 config.json 里指定 provider 的 apiKey（空/缺失返回空串）。
+fn read_provider_api_key(provider_id: &str) -> String {
+    let Ok(path) = config_file() else {
+        return String::new();
+    };
+    let Ok(text) = fs::read_to_string(path) else {
+        return String::new();
+    };
+    let Ok(cfg) = serde_json::from_str::<Value>(&text) else {
+        return String::new();
+    };
+    cfg.get("provider")
+        .and_then(|p| p.get(provider_id))
+        .and_then(|p| p.get("options"))
+        .and_then(|o| o.get("apiKey"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+/// oauth 帐号切到 start-plan 入口时，若该入口没有 apiKey，把当前 credentials
+/// 里的 zcodejwttoken 写进去（与切号流程 prepare_config_provider_keys_update 同语义）。
+fn ensure_start_plan_entry_credentials(family: &str) -> R<()> {
+    let entry_id = format!("builtin:{}-start-plan", family);
+    if !read_provider_api_key(&entry_id).is_empty() {
+        return Ok(());
+    }
+    let cred_bytes = fs::read(credentials_file()?)?;
+    let Some(jwt) = zcode_jwt_from_credentials(&cred_bytes)? else {
+        return Err(AppError::Msg(
+            "start-plan 入口缺少凭据，且 credentials.json 里没有可用的 zcodejwttoken".into(),
+        ));
+    };
+    let path = config_file()?;
+    let text = fs::read_to_string(&path)?;
+    let mut cfg: Value = serde_json::from_str(&text)
+        .map_err(|e| AppError::Msg(format!("config.json 解析失败：{}", e)))?;
+    let Some(api_key) = cfg
+        .get_mut("provider")
+        .and_then(|p| p.get_mut(&entry_id))
+        .and_then(|p| p.get_mut("options"))
+        .and_then(|o| o.get_mut("apiKey"))
+    else {
+        return Err(AppError::Msg(format!(
+            "config.json 里没有 {} 供应者入口",
+            entry_id
+        )));
+    };
+    if let Some(slot) = api_key.as_str() {
+        if slot.trim().is_empty() {
+            *api_key = Value::String(jwt);
+            let bytes = serde_json::to_vec_pretty(&cfg)?;
+            // 与切号一致：原地写让 ZCode 的文件监听识别为同文件修改。
+            write_in_place(&path, &bytes)?;
+        }
+    }
+    Ok(())
+}
+
+/// 帐号内套餐切换：把 ZCode 的 `modelProviderFamilySelectedKeys[family]`
+/// 指向另一个套餐入口（start-plan / coding-plan）。
+///
+/// 优先走 CDP（渲染层 settingService.update，运行中的 ZCode 立即生效——
+/// 实测 ZCode 不监听 setting.json 外部修改，直接改文件只对下次启动有效）；
+/// CDP 不可用时退回直接写 setting.json，返回 applied_live=false。
+pub async fn switch_plan_internal(target: &str) -> Result<PlanSwitchOutcome, String> {
+    let (selected_key, family) = plan_selected_key(target)?;
+
+    if target == "coding-plan" {
+        // coding-plan 入口走 open.bigmodel.cn 的 API Key 认证；没有 key 时
+        // 切过去只会让所有请求 401，必须拒绝。
+        let entry_id = format!("builtin:{}-coding-plan", family);
+        if read_provider_api_key(&entry_id).is_empty() {
+            return Err(format!(
+                "{} 入口没有 API Key（请先在 ZCode 中登录/领取 Coding Plan 后重试）",
+                entry_id
+            ));
+        }
+    } else {
+        ensure_start_plan_entry_credentials(&family).map_err(|e| e.to_string())?;
+    }
+
+    // 1. 实时路径：CDP settingService.update（内存 + 磁盘同时更新）。
+    match crate::zcode_cdp::try_update_selected_provider(&selected_key).await {
+        Ok(new_key) => {
+            // 让 ZCode 顺带刷新 Coding Plan 入口的 key 缓存与权益状态。
+            crate::zcode_cdp::schedule_post_switch_refresh();
+            return Ok(PlanSwitchOutcome {
+                selected_key: new_key,
+                applied_live: true,
+            });
+        }
+        Err(e) => {
+            eprintln!("[plan-switch] CDP 实时切换不可用，退回文件写入：{}", e);
+        }
+    }
+
+    // 2. 兜底路径：直接 patch setting.json（下次启动 ZCode 生效）。
+    let setting_path = setting_file().map_err(|e| e.to_string())?;
+    let text = if setting_path.exists() {
+        fs::read_to_string(&setting_path).map_err(|e| e.to_string())?
+    } else {
+        "{}".to_string()
+    };
+    let bytes = merge_selected_provider_key(&text, &family, &selected_key)
+        .ok_or_else(|| format!("selected key 已是 {}", selected_key))?;
+    if setting_path.exists() {
+        // 与切号流程一致：先留一份带时间戳的备份。
+        if let Ok(backup_dir_path) = backup_dir() {
+            let _ = fs::create_dir_all(&backup_dir_path);
+            let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+            let dst = backup_dir_path.join(format!("setting.plan-switch.{}.json", ts));
+            let _ = fs::copy(&setting_path, &dst);
+        }
+    } else if let Some(parent) = setting_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    write_in_place(&setting_path, &bytes).map_err(|e| e.to_string())?;
+    Ok(PlanSwitchOutcome {
+        selected_key,
+        applied_live: false,
+    })
+}
+
+/// 切换帐号内的套餐入口（前端在低额度自动切换与手动操作时调用）。
+#[tauri::command]
+pub async fn switch_plan(target: String) -> R<PlanSwitchOutcome> {
+    switch_plan_internal(&target).await.map_err(AppError::Msg)
+}
+
 /// 重命名档案。
 #[tauri::command]
 pub fn rename_profile(id: String, name: String) -> R<bool> {
@@ -1873,6 +2070,76 @@ pub async fn fetch_quota(id: Option<String>) -> R<crate::quota::QuotaInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_selected_key_builds_entry_and_validates_target() {
+        assert_eq!(
+            plan_selected_key_for_family("bigmodel", "start-plan")
+                .unwrap()
+                .0,
+            "coding-plan:builtin:bigmodel-start-plan"
+        );
+        assert_eq!(
+            plan_selected_key_for_family("zai", " Coding-Plan ")
+                .unwrap()
+                .0,
+            "coding-plan:builtin:zai-coding-plan"
+        );
+        assert!(plan_selected_key_for_family("bigmodel", "global-build").is_err());
+        assert!(plan_selected_key_for_family("bigmodel", "").is_err());
+    }
+
+    #[test]
+    fn merge_selected_provider_key_merges_and_is_idempotent() {
+        let setting = r#"{
+  "providerFamilyDomain": "bigmodel",
+  "modelProviderFamilyModes": { "bigmodel": "oauth" },
+  "modelProviderFamilySelectedKeys": { "bigmodel": "coding-plan:builtin:bigmodel-coding-plan" }
+}"#;
+        let merged = merge_selected_provider_key(
+            setting,
+            "bigmodel",
+            "coding-plan:builtin:bigmodel-start-plan",
+        )
+        .expect("应产生更新");
+        let value: Value = serde_json::from_slice(&merged).expect("merged json");
+        assert_eq!(
+            value["modelProviderFamilySelectedKeys"]["bigmodel"],
+            "coding-plan:builtin:bigmodel-start-plan"
+        );
+        // 其它键与其它 family 原样保留
+        assert_eq!(value["providerFamilyDomain"], "bigmodel");
+        assert_eq!(value["modelProviderFamilyModes"]["bigmodel"], "oauth");
+
+        // 已是目标值 → 不产生更新
+        assert!(merge_selected_provider_key(
+            &String::from_utf8(merged).unwrap(),
+            "bigmodel",
+            "coding-plan:builtin:bigmodel-start-plan"
+        )
+        .is_none());
+
+        // zai family 与 bigmodel 互不影响
+        let merged_zai = merge_selected_provider_key(
+            setting,
+            "zai",
+            "coding-plan:builtin:zai-start-plan",
+        )
+        .expect("zai 应产生更新");
+        let value_zai: Value = serde_json::from_slice(&merged_zai).unwrap();
+        assert_eq!(
+            value_zai["modelProviderFamilySelectedKeys"]["bigmodel"],
+            "coding-plan:builtin:bigmodel-coding-plan",
+            "bigmodel 不应被改动"
+        );
+        assert_eq!(
+            value_zai["modelProviderFamilySelectedKeys"]["zai"],
+            "coding-plan:builtin:zai-start-plan"
+        );
+
+        // 损坏的 JSON → 不写入（宁可不切，也不能覆盖用户配置）
+        assert!(merge_selected_provider_key("not json", "bigmodel", "x").is_none());
+    }
 
     #[test]
     fn identity_key_prefers_email_then_phone_then_user_id() {

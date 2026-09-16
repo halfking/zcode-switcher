@@ -559,7 +559,9 @@ function AccountCard({
                 ? (plan.is_current ||
                     isPlanCurrent(plan, quota?.active_provider))
                 : false;
-              const items = group.items.slice(0, isListView ? 2 : 4);
+              // 积分套餐有 5小时/周/月等窗口 + 工具额度，全部放行。
+              // Lite 只有 5h+周两窗口，更高套餐可能有月窗口。
+              const items = group.items.slice(0, 6);
               if (!plan && items.length === 0) return null;
               return (
                 <div

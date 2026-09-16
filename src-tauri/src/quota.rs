@@ -416,7 +416,8 @@ fn read_bigmodel_provider_key(provider_id: &str) -> Option<String> {
 }
 
 /// 窗口 → 周期标记（与官网窗口对齐；unit=3 & number=5 是 5 小时窗口，
-/// unit=6 & number=1 是每周窗口，unit=5 & number=1 是每月窗口）。
+/// unit=6 & number=1 是每周窗口，unit=5 & number=1 是每月窗口；
+/// Lite 套餐只返回 5h+周两窗口，更高套餐可能有月窗口）。
 fn window_period(unit: i64, number: i64) -> Option<String> {
     match (unit, number) {
         (3, 5) => Some("5h".into()),
@@ -428,7 +429,8 @@ fn window_period(unit: i64, number: i64) -> Option<String> {
 
 /// 积分桶展示名。unit/number 描述重置窗口：unit=3 & number=5 是 5 小时窗口
 /// （官网叫"积分"），unit=6 & number=1 是每周窗口（官网叫"周积分"），
-/// unit=5 & number=1 是每月窗口（"月积分"）。
+/// unit=5 & number=1 是每月窗口（"月积分"）；
+/// Lite 套餐只有 5h+周两窗口，更高套餐可能返回月窗口。
 fn credit_window_label(unit: i64, number: i64) -> String {
     let unit_word = match unit {
         3 => "小时",

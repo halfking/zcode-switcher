@@ -5,6 +5,7 @@ import {
   type ApiFormat,
   type AccountPoolEntryView,
   type CustomProviderView,
+  type PlanEntryTarget,
   type ProfileView,
   type ProxyStatus,
   type QuotaInfo,
@@ -12,9 +13,14 @@ import {
 import {
   accountHeadroom,
   glm52Remaining,
-  isAccountLow,
   isSwitchableCandidate,
 } from "./lib/glm52";
+import {
+  currentPlanEntry,
+  isCurrentEntryLow,
+  pickPlanSwitchTarget,
+  planEntryLabelKey,
+} from "./lib/quotaGuard";
 import { primaryQuotaRemaining } from "./lib/quotaSort";
 import { getTexts, type Language } from "./i18n";
 
@@ -27,6 +33,13 @@ export type AccountSortMode =
   | "quota-desc"
   | "quota-asc"
   | "expiry-asc";
+/**
+ * 低额度时的动作方式：
+ * - "switch"：帐号内先切套餐（Start Plan 入口 ↔ Coding Plan 入口），
+ *   所有套餐都低于阈值后才切换帐号；
+ * - "pause"：低于阈值时拦截模型请求并暂停一切自动切换，等待人工处理。
+ */
+export type LowQuotaAction = "switch" | "pause";
 const DEFAULT_ACCOUNT_SORT_MODE: AccountSortMode = "name-asc";
 
 const FLOATING_WINDOW_STORAGE_KEY = "zcs:floatingWindowMode";
@@ -38,6 +51,10 @@ const GLM52_DEFAULT_THRESHOLD_WAN = 200;
 const GLM52_POINT_THRESHOLD_MIN = 10;
 const GLM52_POINT_THRESHOLD_MAX = 5000;
 const GLM52_DEFAULT_POINT_THRESHOLD = 200;
+const DEFAULT_LOW_QUOTA_ACTION: LowQuotaAction = "switch";
+// 帐号内套餐切换的防抖：成功后 60 秒内不重复切换，失败后 10 分钟再重试。
+const PLAN_SWITCH_COOLDOWN_MS = 60_000;
+const PLAN_SWITCH_RETRY_COOLDOWN_MS = 10 * 60_000;
 const DEFAULT_QUOTA_REFRESH_INTERVAL_MINUTES = 10;
 const DEFAULT_ACTIVE_QUOTA_REFRESH_INTERVAL_MINUTES = 1;
 const ACTIVE_QUOTA_REFRESH_INTERVAL_MINUTES_KEY = "zcs:activeQuotaRefreshIntervalMinutes";
@@ -73,6 +90,8 @@ interface AppState {
   glm52AutoSwitchThresholdWan: number;
   /** 自动切换阈值（账号积分剩余），单位：积分；各积分桶取最小值参与判定 */
   glm52AutoSwitchPointThreshold: number;
+  /** 低额度时的动作方式（见 LowQuotaAction 注释） */
+  glm52LowQuotaAction: LowQuotaAction;
   /**
    * 无可切换账号时的自动暂停标记（会话内状态，不持久化）：
    * 暂停期间不做任何切换尝试（监测回落到慢速档），防止在低额度
@@ -121,6 +140,7 @@ interface AppState {
   setGlm52AutoSwitchEnabled: (v: boolean) => void;
   setGlm52AutoSwitchThresholdWan: (v: number) => void;
   setGlm52AutoSwitchPointThreshold: (v: number) => void;
+  setGlm52LowQuotaAction: (v: LowQuotaAction) => void;
   setAutoSwitchPaused: (v: boolean) => void;
   setAutoRestart: (v: boolean) => void;
   setTryNoRestartSwitch: (v: boolean) => void;
@@ -160,6 +180,11 @@ interface AppState {
 
 let toastSeq = 1;
 let glm52AutoSwitching = false;
+// 帐号内套餐切换的冷却记账（跨刷新周期防抖）。
+let lastPlanSwitchAttemptAt = 0;
+let lastPlanSwitchFailed = false;
+// 暂停模式的提示只发一次；额度恢复或人工处理后再置位。
+let guardPauseNotified = false;
 
 let refreshAllInFlight = false;
 
@@ -291,6 +316,15 @@ function loadGlm52AutoSwitchPointThreshold(): number {
       : GLM52_DEFAULT_POINT_THRESHOLD;
   } catch {
     return GLM52_DEFAULT_POINT_THRESHOLD;
+  }
+}
+function loadGlm52LowQuotaAction(): LowQuotaAction {
+  try {
+    return localStorage.getItem("zcs:glm52LowQuotaAction") === "pause"
+      ? "pause"
+      : DEFAULT_LOW_QUOTA_ACTION;
+  } catch {
+    return DEFAULT_LOW_QUOTA_ACTION;
   }
 }
 function loadTheme(): Theme {
@@ -438,6 +472,16 @@ function applyTheme(theme: Theme) {
     });
 }
 
+/**
+ * 低额度自动动作（每次额度刷新后调用）。
+ *
+ * 判定对象是 ZCode 当前选中的套餐入口（setting.json 的 selected key）：
+ * - 切换模式："当前入口"余额不足时，先切到同帐号内有余额的另一个入口
+ *   （Start Plan 入口 ↔ Coding Plan 入口，即切套餐）；帐号内所有套餐都
+ *   低于阈值后才切换帐号（候选帐号同样要求其已知量纲全部高于阈值）。
+ * - 暂停模式：当前入口余额不足时，让本地网关拦截所有模型请求（429/SSE
+ *   error），并停止一切自动切换，等待人工处理；额度恢复后自动解除。
+ */
 async function maybeSwitchGlm52Account(state: AppState) {
   const t = getTexts(state.language);
   if (!state.glm52AutoSwitchEnabled || glm52AutoSwitching || state.busy) return;
@@ -448,14 +492,113 @@ async function maybeSwitchGlm52Account(state: AppState) {
 
   const tokenWan = state.glm52AutoSwitchThresholdWan;
   const pointThreshold = state.glm52AutoSwitchPointThreshold;
+  const currentLow = isCurrentEntryLow(activeQuota, tokenWan, pointThreshold);
 
-  // 当前账号 token / 积分任一量纲跌破阈值才需要切换；
-  // 双量纲都恢复到阈值之上时，自动解除暂停继续工作。
-  if (!isAccountLow(activeQuota, tokenWan, pointThreshold)) {
+  if (state.glm52LowQuotaAction === "pause") {
+    if (!currentLow) {
+      // 恢复：解除网关拦截与提示状态。
+      if (guardPauseNotified) {
+        guardPauseNotified = false;
+        state.toast(t.glmGuardResumed, "success");
+      }
+      if (state.autoSwitchPaused) state.setAutoSwitchPaused(false);
+      void api.setQuotaGuard(false, "").catch(() => {});
+      return;
+    }
+    void api.setQuotaGuard(true, t.glmGuardReason).catch(() => {});
+    if (!guardPauseNotified) {
+      // 暂停模式是用户显式选择的另一种动作：仅通过网关拦截 + toast
+      // 表达暂停，不修改 autoSwitchPaused（其语义是"所有账号 Token/
+      // 积分均低于阈值"，与本模式无关，否则全局 UI 文案会不一致）。
+      guardPauseNotified = true;
+      state.toast(t.glmGuardPaused, "warn");
+    }
+    return;
+  }
+
+  // 切换模式：清掉可能残留的网关拦截。
+  if (guardPauseNotified) {
+    guardPauseNotified = false;
+    state.toast(t.glmGuardResumed, "success");
+  }
+  void api.setQuotaGuard(false, "").catch(() => {});
+
+  // 当前入口余额充足（或入口未知且整帐号判定未触发）→ 无需动作。
+  if (!currentLow) {
     if (state.autoSwitchPaused) state.setAutoSwitchPaused(false);
     return;
   }
 
+  // 第 1 步：帐号内先切套餐。入口未知（读不到 active_provider）时跳过——
+  // 不知道当前在哪个入口就盲切只会把请求切到错误的量纲上。
+  const currentEntry = currentPlanEntry(activeQuota.active_provider);
+  if (currentEntry) {
+    const target: PlanEntryTarget | null = pickPlanSwitchTarget(
+      activeQuota,
+      currentEntry,
+      tokenWan,
+      pointThreshold
+    );
+    if (target) {
+      const cooldown = lastPlanSwitchFailed
+        ? PLAN_SWITCH_RETRY_COOLDOWN_MS
+        : PLAN_SWITCH_COOLDOWN_MS;
+      if (Date.now() - lastPlanSwitchAttemptAt < cooldown) {
+        return; // 冷却期内，等下一轮刷新复核
+      }
+      lastPlanSwitchAttemptAt = Date.now();
+      glm52AutoSwitching = true;
+      try {
+        state.toast(
+          t.glmAutoSwitchingPlan.replace(
+            "{plan}",
+            t[planEntryLabelKey(target)]
+          ),
+          "info"
+        );
+        const outcome = await api.switchPlan(target);
+        lastPlanSwitchFailed = false;
+        if (outcome.applied_live) {
+          state.toast(
+            t.glmPlanSwitchedLive.replace(
+              "{plan}",
+              t[planEntryLabelKey(target)]
+            ),
+            "success"
+          );
+        } else {
+          state.toast(
+            t.glmPlanSwitchedNeedRestart.replace(
+              "{plan}",
+              t[planEntryLabelKey(target)]
+            ),
+            "warn"
+          );
+          // 实时通道不可用（ZCode 未开/无调试端口）：开了自动重启就直接重启，
+          // 让写入的配置立即生效。
+          const { autoRestart, tryNoRestartSwitch } = state;
+          if (autoRestart && !tryNoRestartSwitch) {
+            await state.restartZcode();
+          }
+        }
+        await state.refreshQuota(active.id);
+        return;
+      } catch (e) {
+        // 典型原因：coding-plan 入口没有 API Key → 该入口实际不可用，
+        // 视同耗尽，继续走帐号切换；失败后进入长冷却，避免每轮刷新都报错。
+        lastPlanSwitchFailed = true;
+        state.toast(
+          t.glmPlanSwitchFailed.replace("{error}", String(e)),
+          "error"
+        );
+      } finally {
+        glm52AutoSwitching = false;
+      }
+    }
+  }
+
+  // 第 2 步：帐号内所有套餐都低于阈值 → 切换帐号（候选帐号要求其已知的
+  // token/积分量纲全部高于阈值，避免在耗尽的账号之间循环切换）。
   const candidate = state.profiles
     .filter((p) => p.id !== active.id)
     .map((profile) => ({ profile, quota: state.quotas[profile.id] }))
@@ -529,6 +672,7 @@ export const useStore = create<AppState>((set, get) => {
     glm52AutoSwitchEnabled: loadGlm52AutoSwitchEnabled(),
     glm52AutoSwitchThresholdWan: loadGlm52AutoSwitchThresholdWan(),
     glm52AutoSwitchPointThreshold: loadGlm52AutoSwitchPointThreshold(),
+    glm52LowQuotaAction: loadGlm52LowQuotaAction(),
     autoSwitchPaused: false,
     autoRestart: initialAutoRestart,
     tryNoRestartSwitch: initialTryNoRestartSwitch,
@@ -606,6 +750,10 @@ export const useStore = create<AppState>((set, get) => {
         }
       }
       const r = await api.switchTo(id);
+      // 人工/自动切号都视为已介入处理：立即解除网关拦截（暂停模式下
+      // 新账号的额度会在随后的刷新里重新评估）。
+      guardPauseNotified = false;
+      void api.setQuotaGuard(false, "").catch(() => {});
       // 就地翻 active 标记，排序交给渲染层
       set((s) => ({
         profiles: s.profiles.map((p) => ({ ...p, active: p.id === r.id })),
@@ -878,12 +1026,31 @@ export const useStore = create<AppState>((set, get) => {
     } catch {
       /* ignore */
     }
+    if (!v) {
+      // 关闭自动切换时同步解除网关拦截，避免守护标志残留。
+      guardPauseNotified = false;
+      void api.setQuotaGuard(false, "").catch(() => {});
+    }
     // 重新开启时清掉上一轮的自动暂停，让切换判定从头开始。
     set(
       v
         ? { glm52AutoSwitchEnabled: true, autoSwitchPaused: false }
         : { glm52AutoSwitchEnabled: false }
     );
+  },
+
+  setGlm52LowQuotaAction: (v) => {
+    try {
+      localStorage.setItem("zcs:glm52LowQuotaAction", v);
+    } catch {
+      /* ignore */
+    }
+    if (v === "switch") {
+      // 从暂停模式切回切换模式：立即解除网关拦截。
+      guardPauseNotified = false;
+      void api.setQuotaGuard(false, "").catch(() => {});
+    }
+    set({ glm52LowQuotaAction: v });
   },
 
   setGlm52AutoSwitchThresholdWan: (v) => {

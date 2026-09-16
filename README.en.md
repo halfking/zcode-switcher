@@ -39,7 +39,7 @@ All account profiles are stored on your own computer and are not uploaded to any
 | JSON import/export | Back up and migrate account profiles |
 | Seamless switching | Switch accounts without restarting ZCode; config changes take effect immediately |
 | Quota display | Show quota, subscription status, and refresh results |
-| GLM-5.2 auto switching | Automatically switch to an account with more remaining quota when the current quota is below the threshold |
+| GLM-5.2 auto switching | On low quota, switch to another plan with balance inside the account first, then switch accounts once all plans are exhausted; a pause mode is also available for manual handling |
 | Capsule floating window | Show GLM-5.2 account pool stats and support resizing |
 | Scheduled refresh | Refresh quota by minute and keep the latest quota data after closing the app |
 | Multi-language UI | Supports Chinese, English, and Russian |
@@ -61,7 +61,7 @@ The macOS build is not yet notarized with an Apple Developer ID. On first launch
 3. To add more accounts, switch accounts in ZCode first, use OAuth login in the tool, or import a JSON / ZIP backup file.
 4. Saved accounts will show nickname, subscription expiration date, quota progress bars, and refresh status in the list.
 5. After enabling seamless switching, click the switch button on an account card to switch accounts. The switch does not require restarting ZCode, and the account config takes effect immediately.
-6. If you use GLM-5.2, enable low-quota auto switching. When the current account quota is below the threshold, the app automatically switches to an account with more remaining quota.
+6. If you use GLM-5.2, enable low-quota auto switching. The default "auto switch plan/account" mode first switches to another plan with balance inside the current account, and switches to an account with more remaining quota only after all plans fall below the threshold. Alternatively, choose "pause execution" to block requests and wait for manual handling when the quota drops below the threshold.
 7. If you want account pool status to stay visible, enable capsule floating mode and place the quota stats in a desktop corner.
 
 ## Screenshots

@@ -406,12 +406,232 @@ fn quota_probe_cli() -> i32 {
     }
 }
 
+/// 额度守护真机自测（`zcode-switcher.exe --guard-selftest [端口]`）。
+/// 起一个独立网关实例，验证暂停标志生效链路：注入暂停 → 非流式请求被 429 拦截
+/// → 流式请求以 SSE error 事件返回 → 解除暂停后恢复放行。全程不打上游、
+/// 不写 ZCode 配置。返回进程退出码。
+fn guard_selftest_cli() -> i32 {
+    let port: u16 = std::env::args()
+        .nth(2)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(17899);
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("tokio runtime 创建失败：{}", e);
+            return 1;
+        }
+    };
+    runtime.block_on(async {
+        let mut failures = 0usize;
+
+        // 1. 起一个独立网关（不写 ZCode 配置）
+        let (port, shutdown) = match proxy::serve_on(port, "guard-selftest-key".into()).await {
+            Ok(result) => result,
+            Err(e) => {
+                eprintln!("[1] 启动自测网关失败: {}", e);
+                return 1;
+            }
+        };
+        println!("[1] 自测网关已启动: 127.0.0.1:{}", port);
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{}/v1/messages", port);
+
+        // 2. 注入暂停 → 非流式请求应被 429 拒绝
+        let status = proxy::quota_guard_set_for_test(true, "自测：余额低于阈值");
+        println!("[2] 守护状态注入: paused={} reason={:?}", status.paused, status.reason);
+
+        let body = serde_json::json!({
+            "model": "glm-5.3",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": false
+        });
+        match client
+            .post(&url)
+            .header("x-api-key", "guard-selftest-key")
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                if status.as_u16() == 429
+                    && text.contains("rate_limit_error")
+                    && text.contains("额度守护")
+                {
+                    println!("[2] 暂停时非流式拦截: PASS (HTTP 429)");
+                } else {
+                    println!(
+                        "[2] 暂停时非流式拦截: FAIL (status={} body={})",
+                        status,
+                        text.chars().take(200).collect::<String>()
+                    );
+                    failures += 1;
+                }
+            }
+            Err(e) => {
+                println!("[2] 暂停时非流式拦截: FAIL (请求异常 {})", e);
+                failures += 1;
+            }
+        }
+
+        // 3. 暂停时流式请求应以 SSE error 事件返回
+        let body_stream = serde_json::json!({
+            "model": "glm-5.3",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        });
+        match client
+            .post(&url)
+            .header("x-api-key", "guard-selftest-key")
+            .json(&body_stream)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                if status.as_u16() == 200
+                    && text.contains("event: error")
+                    && text.contains("额度守护")
+                {
+                    println!("[3] 暂停时流式拦截: PASS (SSE error)");
+                } else {
+                    println!(
+                        "[3] 暂停时流式拦截: FAIL (status={} body={})",
+                        status,
+                        text.chars().take(200).collect::<String>()
+                    );
+                    failures += 1;
+                }
+            }
+            Err(e) => {
+                println!("[3] 暂停时流式拦截: FAIL (请求异常 {})", e);
+                failures += 1;
+            }
+        }
+
+        // 4. 解除暂停 → 请求不再被守护拦截（无上游时表现为 502/400 而非 429）
+        let status = proxy::quota_guard_set_for_test(false, "");
+        if !status.paused {
+            println!("[4] 守护解除: PASS (paused=false)");
+        } else {
+            println!("[4] 守护解除: FAIL");
+            failures += 1;
+        }
+        match client
+            .post(&url)
+            .header("x-api-key", "guard-selftest-key")
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.as_u16() != 429 {
+                    println!("[5] 解除后放行: PASS (status={}，非守护拦截)", status);
+                } else {
+                    println!("[5] 解除后放行: FAIL (仍被 429 拦截)");
+                    failures += 1;
+                }
+            }
+            Err(e) => {
+                println!("[5] 解除后放行: FAIL (请求异常 {})", e);
+                failures += 1;
+            }
+        }
+
+        let _ = shutdown.send(());
+        println!(
+            "== 守护自测完成: {} ==",
+            if failures == 0 { "全部通过" } else { "存在失败" }
+        );
+        if failures > 0 { 1 } else { 0 }
+    })
+}
+
+/// 帐号内套餐切换真机验证（`zcode-switcher.exe --plan-switch-probe <target>`）。
+/// target 为 start-plan / coding-plan；执行后读回 setting.json 验证落盘值。
+/// 注意：会真实切换当前帐号的套餐入口，验证后请再执行一次切回。
+fn plan_switch_probe_cli() -> i32 {
+    let Some(target) = std::env::args().nth(2) else {
+        eprintln!("用法: zcode-switcher.exe --plan-switch-probe <start-plan|coding-plan>");
+        return 2;
+    };
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("tokio runtime 创建失败：{}", e);
+            return 1;
+        }
+    };
+    match runtime.block_on(profile::switch_plan_internal(&target)) {
+        Ok(outcome) => {
+            println!(
+                "切换结果: selected_key={} applied_live={}",
+                outcome.selected_key, outcome.applied_live
+            );
+            // 读回 setting.json 验证磁盘值
+            match profile::setting_file() {
+                Ok(path) => match std::fs::read_to_string(path) {
+                    Ok(text) => {
+                        let family = if outcome.selected_key.contains(":builtin:zai-") {
+                            "zai"
+                        } else {
+                            "bigmodel"
+                        };
+                        match serde_json::from_str::<serde_json::Value>(&text) {
+                            Ok(v) => {
+                                let on_disk = v
+                                    .get("modelProviderFamilySelectedKeys")
+                                    .and_then(|s| s.get(family))
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or("(缺失)");
+                                if on_disk == outcome.selected_key {
+                                    println!(
+                                        "落盘验证: PASS (modelProviderFamilySelectedKeys.{} = {})",
+                                        family, on_disk
+                                    );
+                                    0
+                                } else {
+                                    println!("落盘验证: FAIL (磁盘={} 期望={})", on_disk, outcome.selected_key);
+                                    1
+                                }
+                            }
+                            Err(e) => {
+                                println!("落盘验证: FAIL (setting.json 解析失败 {})", e);
+                                1
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("落盘验证: FAIL (读取失败 {})", e);
+                        1
+                    }
+                },
+                Err(e) => {
+                    println!("落盘验证: FAIL ({} )", e);
+                    1
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("切换失败: {}", e);
+            1
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // --quota-probe：无窗口的真机验证模式（bin 目标自带 manifest，可在
-    // 无 cargo test 环境下验证完整刷新链路）。
-    if std::env::args().nth(1).as_deref() == Some("--quota-probe") {
-        std::process::exit(quota_probe_cli());
+    // --quota-probe / --guard-selftest / --plan-switch-probe：无窗口的真机
+    // 验证模式（bin 目标自带 manifest，可在无 cargo test 环境下验证链路）。
+    match std::env::args().nth(1).as_deref() {
+        Some("--quota-probe") => std::process::exit(quota_probe_cli()),
+        Some("--guard-selftest") => std::process::exit(guard_selftest_cli()),
+        Some("--plan-switch-probe") => std::process::exit(plan_switch_probe_cli()),
+        _ => {}
     }
     tauri::Builder::default()
         // Register single-instance before deep-link so callback URLs reuse the
@@ -476,6 +696,7 @@ pub fn run() {
             profile::import_profiles_from_files,
             profile::open_config_dir,
             profile::fetch_quota,
+            profile::switch_plan,
             custom_provider::list_custom_providers,
             custom_provider::add_custom_provider,
             custom_provider::update_custom_provider,
@@ -483,6 +704,8 @@ pub fn run() {
             proxy::start_proxy,
             proxy::stop_proxy,
             proxy::proxy_status,
+            proxy::set_quota_guard,
+            proxy::quota_guard_status,
             proxy_pool::list_account_pool,
             proxy_pool::add_account_to_pool,
             proxy_pool::set_account_pool_enabled,
@@ -506,9 +729,13 @@ pub fn run() {
         .run(|app, event| {
             // macOS：窗口隐藏到托盘后，点 Dock 图标是用户最自然的重开手势。
             // 不处理 RunEvent::Reopen 的话，关闭窗口后就再也看不到窗口了。
+            // Reopen 是 macOS 专属变体，其他平台编译不过，需条件编译。
+            #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
                 eprintln!("[reopen] event fired, has_visible_windows={has_visible_windows}");
                 tray::restore_main_window(app);
             }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, &event);
         });
 }

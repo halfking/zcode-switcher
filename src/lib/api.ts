@@ -105,6 +105,26 @@ export interface ProxyStatus {
   base_url: string;
 }
 
+/** 额度守护状态（暂停模式下网关拦截请求的总开关）。 */
+export interface QuotaGuardStatus {
+  paused: boolean;
+  reason: string | null;
+  updated_at: number;
+}
+
+/**
+ * 帐号内的套餐入口：ZCode 通过 setting.json 的
+ * modelProviderFamilySelectedKeys[family] 在两个入口间选择消耗哪个套餐。
+ * start-plan → Start/Global Plan（token 桶）；coding-plan → GLM Coding Plan（积分桶）。
+ */
+export type PlanEntryTarget = "start-plan" | "coding-plan";
+
+export interface PlanSwitchOutcome {
+  selected_key: string;
+  /** true = ZCode 运行中已实时生效；false = 只写了配置文件，需重启 ZCode。 */
+  applied_live: boolean;
+}
+
 export interface AccountPoolEntryView {
   profile_id: string;
   name: string;
@@ -133,6 +153,9 @@ export const api = {
       { name }
     ),
   switchTo: (id: string) => cmd<{ id: string; name: string }>("switch_to", { id }),
+  /** 切换当前帐号内的套餐入口（start-plan / coding-plan）。 */
+  switchPlan: (target: PlanEntryTarget) =>
+    cmd<PlanSwitchOutcome>("switch_plan", { target }),
   renameProfile: (id: string, name: string) => cmd<boolean>("rename_profile", { id, name }),
   deleteProfile: (id: string) => cmd<boolean>("delete_profile", { id }),
   exportProfileToFile: (id: string, path: string) =>
@@ -216,6 +239,10 @@ export const api = {
     cmd<ProxyStatus>("start_proxy", { port, gatewayKey }),
   stopProxy: () => cmd<ProxyStatus>("stop_proxy"),
   proxyStatus: () => cmd<ProxyStatus>("proxy_status"),
+  /** 同步额度守护判定：paused=true 时网关拦截所有模型请求。 */
+  setQuotaGuard: (paused: boolean, reason: string) =>
+    cmd<QuotaGuardStatus>("set_quota_guard", { paused, reason }),
+  quotaGuardStatus: () => cmd<QuotaGuardStatus>("quota_guard_status"),
   inspectDownloadUrl: (url: string) =>
     cmd<{ filename: string; contentType: string | null; contentLength: number | null }>(
       "inspect_download_url",
