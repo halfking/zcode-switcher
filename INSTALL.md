@@ -1,5 +1,12 @@
 # zcode-switcher 本地构建与安装配置
 
+> ⚠️ **历史文档**：本文保留作 1.1.12 时期的工具链实录，**最新内容已合并到
+> [`docs/environment.md`](docs/environment.md)**（覆盖 Windows / macOS / Linux
+> 三平台 + 跨平台 CI）。需要查 1.1.14 的工具链版本、坑位、故障排查，请去那里。
+>
+> 1.1.14 起的 Windows 工具链安装走 `scripts/install-toolchain/windows.ps1`；
+> macOS 走 `scripts/install-toolchain/macos.sh`；Linux 走 `scripts/install-toolchain/linux.sh`。
+
 本机器（Windows 10 x64）原本没有 Node.js、Rust、MSVC 工具链。
 本项目最终在「免管理员 / 无 Visual Studio Build Tools」的环境下完成端到端构建与安装包产出。
 本文件说明工具链的来源、位置、复用方式，以及产物布局。

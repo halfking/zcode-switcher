@@ -1,0 +1,74 @@
+name: Build Linux
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    name: Build bare binary (ubuntu-22.04)
+    permissions:
+      contents: read
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      # Tauri 2 在 Linux 上的硬依赖（见 scripts/install-toolchain/linux.sh）。
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential curl wget file pkg-config \
+            libssl-dev libxdo-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Show toolchain
+        run: |
+          cat /etc/os-release
+          rustc --version
+          node --version
+          pkg-config --modversion webkit2gtk-4.1
+
+      - run: npm ci
+
+      - name: Cargo check
+        # 跑通编译就够；Linux 上没有 .msi / .deb / .rpm 打包目标，
+        # 见 docs/environment.md §6。
+        run: cargo check --manifest-path src-tauri/Cargo.toml --release
+
+      - name: Build release binary
+        run: |
+          cd src-tauri
+          cargo build --release --bin zcode-switcher
+
+      - name: Locate binary
+        id: locate
+        run: |
+          BIN="src-tauri/target/release/zcode-switcher"
+          if [ ! -f "$BIN" ]; then
+            echo "::error::no binary at $BIN"
+            exit 1
+          fi
+          file "$BIN"
+          echo "bin=$BIN" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64-binary
+          path: ${{ steps.locate.outputs.bin }}
+          if-no-files-found: error
+          retention-days: 14

@@ -8,6 +8,7 @@
     "build": "tsc && vite build",
     "test:settings": "node scripts/settings-panel-regression.mjs",
     "test:quotaguard": "node scripts/quotaguard-regression.mjs",
+    "env:check": "node scripts/install-toolchain/check.mjs",
     "build:captcha-runtime": "node scripts/prepare-captcha-runtime.cjs",
     "notice:preview": "node scripts/preview-notice.mjs",
     "notice:check": "node scripts/preview-notice.mjs --check",

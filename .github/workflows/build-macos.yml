@@ -1,0 +1,81 @@
+name: Build macOS
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    name: Build DMG (${{ matrix.target }})
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch: apple-silicon
+          - target: x86_64-apple-darwin
+            arch: intel
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          # macOS 上 rust 缓存键要按 target 区分，否则跨 arch 命中错误的 std 库。
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          uname -m
+          rustc --version
+          node --version
+          xcode-select -p
+          # 见 docs/environment.md §7 和 docs/macos.md §7。
+
+      - run: npm ci
+
+      - name: Build DMG
+        run: |
+          npm run tauri build -- \
+            --target ${{ matrix.target }} \
+            --bundles dmg \
+            --config src-tauri/tauri.macos.conf.json
+
+      - name: Locate artifacts
+        id: locate
+        run: |
+          DMG=$(find "src-tauri/target/${{ matrix.target }}/release/bundle/dmg" -name "*.dmg" | head -1)
+          if [ -z "$DMG" ]; then
+            echo "::error::no DMG found"
+            exit 1
+          fi
+          echo "dmg=$DMG" >> "$GITHUB_OUTPUT"
+          ls -lh "$DMG"
+
+      - name: Verify code signature
+        # 仅当 Apple 凭据已配时才签名 / 验证；CI 默认未配 secret，
+        # 这一步以 `|| true` 容忍"未签名"状态，仅在签了名时验证。
+        if: env.APPLE_SIGNING_IDENTITY != ''
+        run: |
+          codesign -dv --verbose=4 "${{ steps.locate.outputs.dmg }}" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}-dmg
+          path: ${{ steps.locate.outputs.dmg }}
+          if-no-files-found: error
+          retention-days: 14
