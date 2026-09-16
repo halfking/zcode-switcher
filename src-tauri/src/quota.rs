@@ -135,15 +135,20 @@ pub async fn fetch_quota(creds_text: &str) -> Result<QuotaInfo, String> {
     };
 
     // Coding Plan（个人套餐，积分制）和 Start Plan（体验套餐）的额度
-    // 不在 zcode-plan 体系里。优先从 mcp/usage（OAuth 三头认证）获取个人套餐积分；
-    // 若失败则降级到用各自供应者的 API Key 查 quota/limit（但 ZCode 不再存储 API Key）。
+    // 不在 zcode-plan 体系里。数据源优先级：
+    // 1. open.bigmodel.cn quota/limit + OAuth access_token —— 官网控制台同源，
+    //    返回实时窗口明细（5 小时积分 / 周积分 / 月度额度）；
+    // 2. 同接口 + 供应者 API Key（ZCode 已不再存储，通常不可用）；
+    // 3. mcp/usage 汇总桶 —— 仅兜底：total_usage 是服务端滞后缓存
+    //    （实测长时间停留在 used=0），不能反映 5 小时窗口的真实用量。
     let mut coding: Option<CodingPlanSnapshot> = None;
-    
-    // 优先尝试 mcp/usage（需要 OAuth token，返回总积分桶）
-    if let Ok(mcp) = fetch_mcp_usage(&client, &token, &creds).await {
-        coding = Some(mcp);
-    } else {
-        // 降级到 quota/limit（需要 API Key，通常已不可用）
+
+    if let Ok(oauth_token) = oauth_access_token(&creds) {
+        if let Ok(snapshot) = fetch_coding_plan_usage(&client, &oauth_token).await {
+            coding = Some(snapshot);
+        }
+    }
+    if coding.is_none() {
         let coding_key = read_bigmodel_provider_key("builtin:bigmodel-coding-plan");
         let start_key = read_bigmodel_provider_key("builtin:bigmodel-start-plan");
         if let Some(key) = coding_key {
@@ -156,6 +161,11 @@ pub async fn fetch_quota(creds_text: &str) -> Result<QuotaInfo, String> {
                     None => coding = Some(start),
                 }
             }
+        }
+    }
+    if coding.is_none() {
+        if let Ok(mcp) = fetch_mcp_usage(&client, &token, &creds).await {
+            coding = Some(mcp);
         }
     }
 
@@ -393,18 +403,33 @@ fn read_bigmodel_provider_key(provider_id: &str) -> Option<String> {
     }
 }
 
-/// 积分桶展示名。unit/number 描述重置窗口：unit=3 & number=5 是 5 小时窗口
-/// （官网叫"积分"），unit=6 & number=1 是每周窗口（官网叫"周积分"）。
-fn credit_window_label(unit: i64, number: i64) -> String {
+/// 窗口 → 周期标记（与官网窗口对齐；unit=3 & number=5 是 5 小时窗口，
+/// unit=6 & number=1 是每周窗口，unit=5 & number=1 是每月窗口）。
+fn window_period(unit: i64, number: i64) -> Option<String> {
     match (unit, number) {
-        (3, 5) => "积分".into(),
+        (3, 5) => Some("5h".into()),
+        (6, 1) => Some("weekly".into()),
+        (5, 1) => Some("monthly".into()),
+        _ => None,
+    }
+}
+
+/// 积分桶展示名。unit/number 描述重置窗口：unit=3 & number=5 是 5 小时窗口
+/// （官网叫"积分"），unit=6 & number=1 是每周窗口（官网叫"周积分"），
+/// unit=5 & number=1 是每月窗口（"月积分"）。
+fn credit_window_label(unit: i64, number: i64) -> String {
+    let unit_word = match unit {
+        3 => "小时",
+        5 => "月",
+        6 => "周",
+        _ => "周期",
+    };
+    match (unit, number) {
+        (3, 5) => "5小时积分".into(),
+        (3, 1) => "小时积分".into(),
         (6, 1) => "周积分".into(),
+        (5, 1) => "月积分".into(),
         _ => {
-            let unit_word = match unit {
-                3 => "小时",
-                6 => "周",
-                _ => "周期",
-            };
             if number == 1 {
                 format!("{unit_word}积分")
             } else {
@@ -414,7 +439,32 @@ fn credit_window_label(unit: i64, number: i64) -> String {
     }
 }
 
+/// 工具额度桶展示名（TIME_LIMIT：MCP 工具调用次数，与积分不同量纲）。
+fn tool_window_label(unit: i64, number: i64) -> String {
+    let unit_word = match unit {
+        3 => "小时",
+        5 => "月",
+        6 => "周",
+        _ => "周期",
+    };
+    match (unit, number) {
+        (3, 5) => "5小时工具额度".into(),
+        (6, 1) => "周工具额度".into(),
+        (5, 1) => "月度工具额度".into(),
+        _ => {
+            if number == 1 {
+                format!("{unit_word}工具额度")
+            } else {
+                format!("{number}{unit_word}工具额度")
+            }
+        }
+    }
+}
+
 /// 解析 quota/limit 响应；未订阅或字段缺失时返回 None。
+///
+/// CREDIT_LIMIT 是积分桶（参与积分阈值判定）；TIME_LIMIT 是 MCP 工具
+/// 调用额度（次数，仅展示）；TOKENS_LIMIT 只有百分比、无绝对值，不展示。
 fn parse_coding_plan_usage(value: &Value) -> Option<CodingPlanSnapshot> {
     // 该接口的成功包络是 {"code":200,"success":true,...}（区别于 billing 的 code=0）。
     let code_ok = value.get("code").and_then(Value::as_i64) == Some(200);
@@ -432,31 +482,36 @@ fn parse_coding_plan_usage(value: &Value) -> Option<CodingPlanSnapshot> {
     let limits = data.get("limits")?.as_array()?;
     let mut items = Vec::new();
     for limit in limits {
-        if limit.get("type").and_then(Value::as_str) != Some("CREDIT_LIMIT") {
+        let limit_type = limit.get("type").and_then(Value::as_str).unwrap_or("");
+        if limit_type != "CREDIT_LIMIT" && limit_type != "TIME_LIMIT" {
             continue;
         }
         let total = limit.get("usage").and_then(Value::as_f64)?;
         let used = limit.get("currentValue").and_then(Value::as_f64)?;
-        let remaining = limit.get("remaining").and_then(Value::as_f64)?;
+        let remaining = limit.get("remaining").and_then(Value::as_f64);
         if !total.is_finite() || total <= 0.0 {
             continue;
         }
+        let remaining = match remaining {
+            Some(v) if v.is_finite() => v,
+            _ => (total - used).max(0.0),
+        };
         let (unit, number) = (
             limit.get("unit").and_then(Value::as_i64).unwrap_or(0),
             limit.get("number").and_then(Value::as_i64).unwrap_or(0),
         );
+        let is_credit = limit_type == "CREDIT_LIMIT";
         items.push(BalanceItem {
-            show_name: credit_window_label(unit, number),
+            show_name: if is_credit {
+                credit_window_label(unit, number)
+            } else {
+                tool_window_label(unit, number)
+            },
             used_units: used,
             total_units: total,
             remaining_units: remaining,
-            unit_type: Some("point".into()),
-            // 5 小时窗口与 billing 侧的 "5h" 周期同义，便于后续按周期聚合。
-            period: match (unit, number) {
-                (3, n) if n > 0 => Some("5h".into()),
-                (6, 1) => Some("weekly".into()),
-                _ => None,
-            },
+            unit_type: Some(if is_credit { "point".into() } else { "tool".into() }),
+            period: window_period(unit, number),
             plan_id: None,
         });
     }
@@ -468,8 +523,9 @@ fn parse_coding_plan_usage(value: &Value) -> Option<CodingPlanSnapshot> {
 
 /// 拉取 Coding Plan（个人套餐，积分制）额度。
 ///
-/// 认证与 ZCode 官方客户端一致：Coding Plan 供应者的 API Key 作
-/// `Authorization: Bearer <key>`（OAuth token 对该接口无效）。
+/// 认证接受两种 Bearer：BigModel OAuth access_token（credentials 里的
+/// oauth:bigmodel:access_token，官网控制台同源）或供应者 API Key。
+/// ZCode 的 zcodejwttoken JWT 对该接口无效（401）。
 /// 多档案顺序刷新会连续请求该接口，429/网络抖动时退避重试一次。
 async fn fetch_coding_plan_usage(
     client: &reqwest::Client,
@@ -523,6 +579,16 @@ async fn fetch_coding_plan_usage(
     Err(last_err.unwrap_or_else(|| "积分额度请求失败".into()))
 }
 
+/// 从 credentials.json 读出并解密 OAuth access_token
+/// （oauth:bigmodel:access_token，quota/limit 与 mcp/usage 都用它认证）。
+fn oauth_access_token(creds: &Value) -> Result<String, String> {
+    let oauth_token = creds
+        .get("oauth:bigmodel:access_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "credentials 缺少 oauth:bigmodel:access_token".to_string())?;
+    crypto::decrypt(oauth_token).map_err(|e| format!("解密 OAuth token 失败：{}", e))
+}
+
 /// 拉取个人套餐积分额度（从 ZCode mcp/usage 接口）。
 ///
 /// 用三头认证：JWT token + OAuth access_token + Bigmodel-Target-Type: PERSONAL。
@@ -533,15 +599,8 @@ async fn fetch_mcp_usage(
     creds: &Value,
 ) -> Result<CodingPlanSnapshot, String> {
     const MCP_USAGE_URL: &str = "https://zcode.z.ai/api/v1/mcp/usage";
-    
-    // 从 credentials.json 读取并解密 OAuth access_token
-    let oauth_token = creds
-        .get("oauth:bigmodel:access_token")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "credentials 缺少 oauth:bigmodel:access_token".to_string())?;
-    
-    let decrypted_oauth = crypto::decrypt(oauth_token)
-        .map_err(|e| format!("解密 OAuth token 失败：{}", e))?;
+
+    let decrypted_oauth = oauth_access_token(&creds)?;
     
     let resp = client
         .get(MCP_USAGE_URL)
@@ -574,10 +633,10 @@ fn parse_mcp_usage(value: &Value) -> Option<CodingPlanSnapshot> {
     let remaining = usage.get("remaining")?.as_f64()?;
     
     let plan_name = match level {
-        "lite" => "个人套餐 Lite",
-        "pro" => "个人套餐 Pro",
-        "max" => "个人套餐 Max",
-        _ => "个人套餐",
+        "lite" => "积分汇总 (Lite)",
+        "pro" => "积分汇总 (Pro)",
+        "max" => "积分汇总 (Max)",
+        _ => "积分汇总",
     };
     
     Some(CodingPlanSnapshot {
@@ -1239,32 +1298,74 @@ mod tests {
     fn parse_coding_plan_usage_payload() {
         let value: Value = serde_json::from_str(
             r#"{"code":200,"msg":"操作成功","data":{"limits":[
-                {"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":2000,"currentValue":988,"remaining":1011,"percentage":49,"nextResetTime":1789457047532},
-                {"type":"CREDIT_LIMIT","unit":6,"number":1,"usage":10000,"currentValue":991,"remaining":9008,"percentage":9,"nextResetTime":1790007765994}
-            ],"level":"lite"},"success":true}"#,
+                {"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":28000,"currentValue":2566,"remaining":25434,"percentage":9,"nextResetTime":1789522664420},
+                {"type":"CREDIT_LIMIT","unit":6,"number":1,"usage":140000,"currentValue":73547,"remaining":66453,"percentage":52,"nextResetTime":1789808998979},
+                {"type":"CREDIT_LIMIT","unit":5,"number":1,"usage":6000,"currentValue":1200,"remaining":4800,"percentage":20,"nextResetTime":1790007765994},
+                {"type":"TIME_LIMIT","unit":5,"number":1,"usage":4000,"currentValue":754,"remaining":3246,"percentage":18,"nextResetTime":1790256740998,"usageDetails":[{"modelCode":"search-prime","usage":676}]},
+                {"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":0}
+            ],"level":"max"},"success":true}"#,
         )
         .unwrap();
         let snapshot = parse_coding_plan_usage(&value).expect("应解析成功");
-        assert_eq!(snapshot.level, "lite");
-        assert_eq!(snapshot.items.len(), 2);
+        assert_eq!(snapshot.level, "max");
+        assert_eq!(snapshot.items.len(), 4);
 
-        // 5 小时窗口的"积分"桶
+        // 5 小时窗口的"5小时积分"桶（官网同源数据）
         let credits = &snapshot.items[0];
-        assert_eq!(credits.show_name, "积分");
-        assert_eq!(credits.used_units, 988.0);
-        assert_eq!(credits.total_units, 2000.0);
-        assert_eq!(credits.remaining_units, 1011.0);
+        assert_eq!(credits.show_name, "5小时积分");
+        assert_eq!(credits.used_units, 2566.0);
+        assert_eq!(credits.total_units, 28000.0);
+        assert_eq!(credits.remaining_units, 25434.0);
         assert_eq!(credits.unit_type.as_deref(), Some("point"));
         assert_eq!(credits.period.as_deref(), Some("5h"));
 
         // 每周窗口的"周积分"桶
         let weekly = &snapshot.items[1];
         assert_eq!(weekly.show_name, "周积分");
-        assert_eq!(weekly.total_units, 10000.0);
-        assert_eq!(weekly.remaining_units, 9008.0);
+        assert_eq!(weekly.total_units, 140000.0);
+        assert_eq!(weekly.remaining_units, 66453.0);
         assert_eq!(weekly.period.as_deref(), Some("weekly"));
 
-        assert_eq!(coding_plan_display_name(&snapshot.level), "GLM Coding Lite");
+        // 每月窗口的"月积分"桶
+        let monthly = &snapshot.items[2];
+        assert_eq!(monthly.show_name, "月积分");
+        assert_eq!(monthly.remaining_units, 4800.0);
+        assert_eq!(monthly.period.as_deref(), Some("monthly"));
+
+        // TIME_LIMIT 是 MCP 工具调用额度（次），仅展示、不参与积分阈值
+        let tool = &snapshot.items[3];
+        assert_eq!(tool.show_name, "月度工具额度");
+        assert_eq!(tool.remaining_units, 3246.0);
+        assert_eq!(tool.unit_type.as_deref(), Some("tool"));
+        assert_eq!(tool.period.as_deref(), Some("monthly"));
+
+        // TOKENS_LIMIT（仅百分比、无绝对值）不产出条目
+        assert!(snapshot
+            .items
+            .iter()
+            .all(|item| item.show_name != "5小时Token"));
+
+        assert_eq!(coding_plan_display_name(&snapshot.level), "GLM Coding Max");
+    }
+
+    #[test]
+    fn credit_window_threshold_uses_min_across_windows() {
+        // 阈值判定语义：任一窗口积分剩余低于阈值即触发（取各积分桶最小值）。
+        let value: Value = serde_json::from_str(
+            r#"{"code":200,"success":true,"data":{"limits":[
+                {"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":28000,"currentValue":27900,"remaining":100},
+                {"type":"CREDIT_LIMIT","unit":6,"number":1,"usage":140000,"currentValue":1000,"remaining":139000}
+            ],"level":"max"}}"#,
+        )
+        .unwrap();
+        let snapshot = parse_coding_plan_usage(&value).expect("应解析成功");
+        let min_point = snapshot
+            .items
+            .iter()
+            .filter(|item| item.unit_type.as_deref() == Some("point"))
+            .map(|item| item.remaining_units)
+            .fold(f64::INFINITY, f64::min);
+        assert_eq!(min_point, 100.0);
     }
 
     #[test]
@@ -1278,14 +1379,14 @@ mod tests {
         let empty: Value =
             serde_json::from_str(r#"{"code":200,"data":{"limits":[],"level":"lite"}}"#).unwrap();
         assert!(parse_coding_plan_usage(&empty).is_none());
-        // 非 CREDIT_LIMIT 的条目被跳过
-        let other: Value = serde_json::from_str(
+        // 仅 TOKENS_LIMIT（无绝对值字段）→ 无可显示积分
+        let tokens_only: Value = serde_json::from_str(
             r#"{"code":200,"success":true,"data":{"limits":[
-                {"type":"TIME_LIMIT","usage":100,"currentValue":10,"remaining":90}
-            ],"level":"lite"}}"#,
+                {"type":"TOKENS_LIMIT","unit":6,"number":1,"percentage":100}
+            ],"level":"max"}}"#,
         )
         .unwrap();
-        assert!(parse_coding_plan_usage(&other).is_none());
+        assert!(parse_coding_plan_usage(&tokens_only).is_none());
     }
 
     /// 真机端到端验证：用真实 credentials 走一遍完整刷新链路。
