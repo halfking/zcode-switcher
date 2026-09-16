@@ -1,5 +1,5 @@
-// isCurrentEntryLow / pickPlanSwitchTarget / entryHealth / currentPlanEntry
-// 单元测试。复盖三个关键回退：
+// isCurrentEntryLow / pickPlanSwitchTarget / entryHealth / currentPlanEntry /
+// firstVerifiedTarget 单元测试。复盖三个关键回退：
 //   1. 单套餐账号回退：active_provider=start-plan，但 balances 里只有
 //      coding-plan 积分（账号只订阅 Coding Plan）→ 入口数据不充分，
 //      仍能基于整账号判定触发切号（不要被"看似充足"误挡住）。
@@ -37,9 +37,9 @@ await writeFile(apiStubPath, apiStub);
 
 const entryPath = join(dir, "entry.mjs");
 const entry = `
-  import { isCurrentEntryLow, pickPlanSwitchTarget, currentPlanEntry, entryHealth }
+  import { isCurrentEntryLow, pickPlanSwitchTarget, currentPlanEntry, entryHealth, firstVerifiedTarget }
     from ${JSON.stringify(posix(join(process.cwd(), "src/lib/quotaGuard.ts")))};
-  globalThis.__qg = { isCurrentEntryLow, pickPlanSwitchTarget, currentPlanEntry, entryHealth };
+  globalThis.__qg = { isCurrentEntryLow, pickPlanSwitchTarget, currentPlanEntry, entryHealth, firstVerifiedTarget };
 `;
 await writeFile(entryPath, entry);
 
@@ -58,7 +58,13 @@ await build({
 });
 
 await import(pathToFileURL(outPath).href);
-const { isCurrentEntryLow, pickPlanSwitchTarget, currentPlanEntry, entryHealth } = globalThis.__qg;
+const {
+  isCurrentEntryLow,
+  pickPlanSwitchTarget,
+  currentPlanEntry,
+  entryHealth,
+  firstVerifiedTarget,
+} = globalThis.__qg;
 
 // ---- fixtures --------------------------------------------------------------
 
@@ -179,6 +185,103 @@ function tokenItem(remaining, name = "GLM-5.3") {
   };
   assert.equal(isCurrentEntryLow(quota, TOKEN_THRESHOLD_WAN, POINT_THRESHOLD), true);
   console.log("[5] 暂停模式锚点 PASS");
+}
+
+// ---- 6. firstVerifiedTarget：逐一验证切换目标 -------------------------------
+//
+// 目标语义（任务：切前必须确认待切换的套餐/帐户确有余额）：
+//   - 按给定顺序逐个用最新拉取的余额复核，第一个通过的成为切换目标；
+//   - 复核不合格（最新余额跌破阈值 / 拉取失败）→ 跳过，继续验证下一个；
+//   - 全部不通过 → 返回 null，调用方绝不执行切换。
+
+// isSwitchableCandidate 的镜像判定（glm52.ts 同语义，测试内联避免多打一个 bundle）：
+// 每个已知量纲都必须严格高于阈值，且至少一个量纲有数据。
+function candidateOk(quota) {
+  if (!quota || quota.error) return false;
+  const token = quota.token ?? null;
+  const point = quota.point ?? null;
+  if (token === null && point === null) return false;
+  if (token !== null && token <= TOKEN_THRESHOLD_WAN * 10_000) return false;
+  if (point !== null && point <= POINT_THRESHOLD) return false;
+  return true;
+}
+
+{
+  // 场景 A：首个候选最新余额仍充足 → 直接选中，且不再刷新后面的候选
+  // （通过即停，不做多余的余额请求）。
+  const refreshed = [];
+  const candidates = [{ id: "A" }, { id: "B" }];
+  const picked = await firstVerifiedTarget(
+    candidates,
+    async (item) => {
+      refreshed.push(item.id);
+      return { id: item.id, token: 800_000, point: 5_000 }; // 都高于阈值
+    },
+    (_item, fresh) => candidateOk(fresh)
+  );
+  assert.equal(picked?.id, "A", "首个候选通过时应被选中");
+  assert.deepEqual(refreshed, ["A"], "通过即停：不应继续刷新后续候选");
+  console.log("[6] 逐一验证：首个候选通过即停 PASS");
+}
+
+{
+  // 场景 B：缓存说候选 A 有余额，但最新余额已耗尽 → 必须跳过 A、验证 B
+  // 并选中 B。这是"绝不从一个没余额的帐户切到另一个没余额的帐户"的核心
+  // 回归点：凭过期缓存切到 A 就是切到了空帐户。
+  const refreshed = [];
+  const latest = {
+    A: { token: 0, point: 0 }, // 缓存充足、实际已耗尽
+    B: { token: 900_000, point: 2_000 },
+  };
+  const candidates = [{ id: "A" }, { id: "B" }];
+  const picked = await firstVerifiedTarget(
+    candidates,
+    async (item) => {
+      refreshed.push(item.id);
+      return { ...latest[item.id], id: item.id };
+    },
+    (_item, fresh) => candidateOk(fresh)
+  );
+  assert.equal(picked?.id, "B", "首个候选复核不合格时应继续验证下一个");
+  assert.deepEqual(refreshed, ["A", "B"], "A、B 都应被逐一刷新验证");
+  console.log("[7] 逐一验证：复核不合格跳过并验证下一个 PASS");
+}
+
+{
+  // 场景 C：所有候选的最新余额都不达标 → 返回 null（绝不切换），
+  // 且每个候选都必须被验证过（逐一，不允许只看第一个就放弃）。
+  const refreshed = [];
+  const candidates = [{ id: "A" }, { id: "B" }, { id: "C" }];
+  const picked = await firstVerifiedTarget(
+    candidates,
+    async (item) => {
+      refreshed.push(item.id);
+      return { id: item.id, token: 0, point: 0 };
+    },
+    (_item, fresh) => candidateOk(fresh)
+  );
+  assert.equal(picked, null, "全部复核不合格时应返回 null（不切换）");
+  assert.deepEqual(refreshed, ["A", "B", "C"], "每个候选都应逐一验证");
+  console.log("[8] 逐一验证：全部不合格返回 null PASS");
+}
+
+{
+  // 场景 D：余额拉取失败（网络/429 等）视为不可验证 → 不合格，继续下一个；
+  // refresh 抛错不允许让整个验证流程中断。
+  const refreshed = [];
+  const candidates = [{ id: "A" }, { id: "B" }];
+  const picked = await firstVerifiedTarget(
+    candidates,
+    async (item) => {
+      refreshed.push(item.id);
+      if (item.id === "A") throw new Error("请求超时");
+      return { id: item.id, token: 900_000, point: 2_000 };
+    },
+    (_item, fresh) => candidateOk(fresh)
+  );
+  assert.equal(picked?.id, "B", "拉取失败的候选应被视为不合格并跳过");
+  assert.deepEqual(refreshed, ["A", "B"], "抛错后应继续验证下一个候选");
+  console.log("[9] 逐一验证：拉取失败视为不可验证 PASS");
 }
 
 // ---- 清理 ------------------------------------------------------------------

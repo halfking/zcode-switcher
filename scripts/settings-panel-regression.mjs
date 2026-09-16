@@ -46,17 +46,34 @@ Object.defineProperty(globalThis, "navigator", { value: dom.window.navigator, co
 Object.defineProperty(dom.window.navigator, "userAgent", { value: "Macintosh; Intel Mac OS X" });
 // Windows 下动态 import 需要 file:// URL，绝对路径（C:\...）会报 ERR_UNSUPPORTED_ESM_URL_SCHEME
 await import(pathToFileURL(bundle).href);
+
+// React 19 并发调度在 jsdom 里可能让 effect / 重渲染晚于固定 sleep 完成，
+// 用轮询代替一次性等待（曾出现 ~20% 概率 100ms 不够导致的偶发失败）。
+const toggleEl = () => document.querySelector('[role="switch"]');
+async function waitFor(cond, desc, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (cond()) return;
+    if (Date.now() > deadline) throw new Error(`waitFor 超时：${desc}`);
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
 globalThis.renderSettings();
-await new Promise((r) => setTimeout(r, 100));
-const toggle = document.querySelector('[role="switch"]');
-assert.equal(toggle.getAttribute("aria-checked"), "false", "disabled discovered ZCode must start off");
-toggle.click();
-await new Promise((r) => setTimeout(r, 20));
-assert.ok(globalThis.calls.includes("zcode_launcher_enable"), "enable is invoked through the toggle UI");
-assert.equal(toggle.getAttribute("aria-checked"), "true", "successful enable turns on");
-toggle.click();
-await new Promise((r) => setTimeout(r, 100));
+await waitFor(
+  () => toggleEl()?.getAttribute("aria-checked") === "false",
+  "scan 结果把禁用的 ZCode 开关关掉"
+);
+toggleEl().click();
+await waitFor(() => {
+  assert.ok(globalThis.calls.includes("zcode_launcher_enable"), "enable is invoked through the toggle UI");
+  return toggleEl()?.getAttribute("aria-checked") === "true";
+}, "enable 成功后开关打开");
+toggleEl().click();
+await waitFor(
+  () => toggleEl()?.getAttribute("aria-checked") === "false",
+  "disable 后端成功后开关关闭"
+);
 assert.deepEqual(globalThis.calls.slice(-2), ["zcode_launcher_disable", "zcode_launcher_scan"]);
-assert.equal(toggle.getAttribute("aria-checked"), "false", "disable turns off only after backend success");
 console.log("PASS settings panel macOS launcher toggle regression");
 await rm(dir, { recursive: true, force: true });

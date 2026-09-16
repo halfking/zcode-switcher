@@ -122,6 +122,34 @@ export function pickPlanSwitchTarget(
   return health.evaluable && !health.low ? other : null;
 }
 
+/**
+ * 逐一验证候选目标：按给定顺序用最新拉取的余额逐个复核，返回第一个
+ * 通过验证的目标；全部不通过（或余额拉取失败）返回 null —— 调用方
+ * 必须放弃切换。用于低额度切换前确认"待切换的套餐/帐户确实有余额"，
+ * 避免依据过期缓存把请求切到已耗尽的套餐/帐户上。
+ *
+ * - `ordered`：候选及验证顺序（调用方先按余量等排序）；
+ * - `refresh`：拉取该目标的最新余额（抛错视为该目标不可验证 → 不合格）；
+ * - `passes`：用最新余额判定该目标是否可切。
+ * 每个候选都会调用 refresh（哪怕前面的失败了），直到某个通过为止。
+ */
+export async function firstVerifiedTarget<T, F>(
+  ordered: readonly T[],
+  refresh: (item: T) => Promise<F>,
+  passes: (item: T, fresh: F | null) => boolean
+): Promise<T | null> {
+  for (const item of ordered) {
+    let fresh: F | null = null;
+    try {
+      fresh = await refresh(item);
+    } catch {
+      fresh = null;
+    }
+    if (passes(item, fresh)) return item;
+  }
+  return null;
+}
+
 /** 供展示/日志用：把入口映射为稳定标识（文案由 i18n 负责）。 */
 export function planEntryLabelKey(entry: PlanEntryTarget): "planEntryStart" | "planEntryCoding" {
   return entry === "coding-plan" ? "planEntryCoding" : "planEntryStart";

@@ -17,6 +17,7 @@ import {
 } from "./lib/glm52";
 import {
   currentPlanEntry,
+  firstVerifiedTarget,
   isCurrentEntryLow,
   pickPlanSwitchTarget,
   planEntryLabelKey,
@@ -478,11 +479,19 @@ function applyTheme(theme: Theme) {
  * 判定对象是 ZCode 当前选中的套餐入口（setting.json 的 selected key）：
  * - 切换模式："当前入口"余额不足时，先切到同帐号内有余额的另一个入口
  *   （Start Plan 入口 ↔ Coding Plan 入口，即切套餐）；帐号内所有套餐都
- *   低于阈值后才切换帐号（候选帐号同样要求其已知量纲全部高于阈值）。
+ *   低于阈值后才切换帐号。
  * - 暂停模式：当前入口余额不足时，让本地网关拦截所有模型请求（429/SSE
  *   error），并停止一切自动切换，等待人工处理；额度恢复后自动解除。
+ *
+ * 切换前强制复核目标余额（防止从耗尽的帐户切到另一个耗尽的帐户）：
+ * - 切套餐：执行 switchPlan 前重新拉取当前帐号的最新余额并复核目标入口
+ *   仍然高于阈值，复核不通过就绝不切换；
+ * - 切帐号：候选先用缓存余量排出验证顺序，然后逐一重新拉取最新余额复核
+ *   （双阈值全部达标才合格），只切到第一个验证通过的帐号；全部不通过
+ *   则进入自动暂停，不做任何切换。
  */
-async function maybeSwitchGlm52Account(state: AppState) {
+async function maybeSwitchGlm52Account(getStore: () => AppState) {
+  const state = getStore();
   const t = getTexts(state.language);
   if (!state.glm52AutoSwitchEnabled || glm52AutoSwitching || state.busy) return;
 
@@ -544,41 +553,60 @@ async function maybeSwitchGlm52Account(state: AppState) {
       }
       lastPlanSwitchAttemptAt = Date.now();
       glm52AutoSwitching = true;
+      let switched = false;
       try {
-        state.toast(
-          t.glmAutoSwitchingPlan.replace(
-            "{plan}",
-            t[planEntryLabelKey(target)]
-          ),
-          "info"
-        );
-        const outcome = await api.switchPlan(target);
-        lastPlanSwitchFailed = false;
-        if (outcome.applied_live) {
-          state.toast(
-            t.glmPlanSwitchedLive.replace(
-              "{plan}",
-              t[planEntryLabelKey(target)]
-            ),
-            "success"
-          );
-        } else {
-          state.toast(
-            t.glmPlanSwitchedNeedRestart.replace(
-              "{plan}",
-              t[planEntryLabelKey(target)]
-            ),
-            "warn"
-          );
-          // 实时通道不可用（ZCode 未开/无调试端口）：开了自动重启就直接重启，
-          // 让写入的配置立即生效。
-          const { autoRestart, tryNoRestartSwitch } = state;
-          if (autoRestart && !tryNoRestartSwitch) {
-            await state.restartZcode();
-          }
-        }
+        // 执行前重新拉取当前帐号的最新余额复核：触发判定的数据可能已经
+        // 过了整轮批量刷新（多帐号逐个拉取，排在前面的可能已是几分钟前），
+        // 复核不通过（目标入口实际已无余额）就绝不执行切套餐。
         await state.refreshQuota(active.id);
-        return;
+        const freshActive = getStore().quotas[active.id];
+        const freshOk = !!freshActive && !freshActive.error;
+        if (freshOk && !isCurrentEntryLow(freshActive, tokenWan, pointThreshold)) {
+          // 复核发现当前入口余额已恢复：无需任何切换。
+          if (getStore().autoSwitchPaused) getStore().setAutoSwitchPaused(false);
+          return;
+        }
+        if (
+          freshOk &&
+          pickPlanSwitchTarget(freshActive, currentEntry, tokenWan, pointThreshold) ===
+            target
+        ) {
+          if (getStore().busy) return; // 验证期间用户开始手动操作：不抢动作
+          state.toast(
+            t.glmAutoSwitchingPlan.replace(
+              "{plan}",
+              t[planEntryLabelKey(target)]
+            ),
+            "info"
+          );
+          const outcome = await api.switchPlan(target);
+          lastPlanSwitchFailed = false;
+          switched = true;
+          if (outcome.applied_live) {
+            state.toast(
+              t.glmPlanSwitchedLive.replace(
+                "{plan}",
+                t[planEntryLabelKey(target)]
+              ),
+              "success"
+            );
+          } else {
+            state.toast(
+              t.glmPlanSwitchedNeedRestart.replace(
+                "{plan}",
+                t[planEntryLabelKey(target)]
+              ),
+              "warn"
+            );
+            // 实时通道不可用（ZCode 未开/无调试端口）：开了自动重启就直接重启，
+            // 让写入的配置立即生效。
+            const { autoRestart, tryNoRestartSwitch } = state;
+            if (autoRestart && !tryNoRestartSwitch) {
+              await state.restartZcode();
+            }
+          }
+          await state.refreshQuota(active.id);
+        }
       } catch (e) {
         // 典型原因：coding-plan 入口没有 API Key → 该入口实际不可用，
         // 视同耗尽，继续走帐号切换；失败后进入长冷却，避免每轮刷新都报错。
@@ -590,12 +618,17 @@ async function maybeSwitchGlm52Account(state: AppState) {
       } finally {
         glm52AutoSwitching = false;
       }
+      if (switched) return;
+      // 复核不通过（目标入口实际已无余额）或切换失败：帐号内已无可用
+      // 套餐入口，落到下面的切帐号验证，绝不留在耗尽的入口上。
     }
   }
 
-  // 第 2 步：帐号内所有套餐都低于阈值 → 切换帐号（候选帐号要求其已知的
-  // token/积分量纲全部高于阈值，避免在耗尽的账号之间循环切换）。
-  const candidate = state.profiles
+  // 第 2 步：帐号内所有套餐都低于阈值 → 切换帐号。候选先用缓存余量排出
+  // 验证顺序，然后逐一重新拉取最新余额复核：其已知 token/积分量纲必须
+  // 全部高于阈值（缓存可能过期，凭旧数据切换会从一个耗尽的帐户切到
+  // 另一个耗尽的帐户）；只切到第一个验证通过的帐号。
+  const orderedCandidates = state.profiles
     .filter((p) => p.id !== active.id)
     .map((profile) => ({ profile, quota: state.quotas[profile.id] }))
     .filter((item) => isSwitchableCandidate(item.quota, tokenWan, pointThreshold))
@@ -604,29 +637,51 @@ async function maybeSwitchGlm52Account(state: AppState) {
       headroom: accountHeadroom(item.quota, tokenWan, pointThreshold),
       tokenRemaining: glm52Remaining(item.quota) ?? 0,
     }))
-    .sort((a, b) => b.headroom - a.headroom || b.tokenRemaining - a.tokenRemaining)[0];
+    .sort((a, b) => b.headroom - a.headroom || b.tokenRemaining - a.tokenRemaining);
 
-  if (!candidate) {
+  if (orderedCandidates.length === 0) {
     // 所有账号的 token/积分都低于阈值：进入自动暂停——暂停期间不做任何
     // 切换尝试（不会在低额度账号间循环切换），监测也回落到慢速档；
     // 仅提示一次，等任一账号额度恢复到双阈值之上后自动继续。
-    if (!state.autoSwitchPaused) {
-      state.setAutoSwitchPaused(true);
+    if (!getStore().autoSwitchPaused) {
+      getStore().setAutoSwitchPaused(true);
       state.toast(t.glmAutoSwitchPaused, "warn");
     }
     return;
   }
 
-  // 出现满足双阈值的候选（含暂停期间额度恢复的情况）：解除暂停并切换。
-  if (state.autoSwitchPaused) state.setAutoSwitchPaused(false);
-
   glm52AutoSwitching = true;
   try {
+    // 逐一验证：每个候选切之前都重新拉取最新余额复核，拉取失败或复核
+    // 不合格的候选直接跳过（绝不盲切），第一个通过验证的才成为目标。
+    const verified = await firstVerifiedTarget(
+      orderedCandidates,
+      async (item) => {
+        await state.refreshQuota(item.profile.id);
+        return getStore().quotas[item.profile.id];
+      },
+      (_item, fresh) =>
+        isSwitchableCandidate(fresh ?? undefined, tokenWan, pointThreshold)
+    );
+
+    if (!verified) {
+      // 逐一验证后没有任何帐号余额达标：宁可暂停也绝不切换。
+      const live = getStore();
+      if (!live.autoSwitchPaused) {
+        live.setAutoSwitchPaused(true);
+        state.toast(t.glmAutoSwitchPaused, "warn");
+      }
+      return;
+    }
+
+    // 出现验证通过的候选（含暂停期间额度恢复的情况）：解除暂停并切换。
+    if (getStore().autoSwitchPaused) getStore().setAutoSwitchPaused(false);
+    if (getStore().busy) return; // 验证期间用户开始手动操作：不抢动作
     state.toast(
-      t.glmAutoSwitching.replace("{name}", candidate.profile.name),
+      t.glmAutoSwitching.replace("{name}", verified.profile.name),
       "info"
     );
-    await state.switchTo(candidate.profile.id);
+    await state.switchTo(verified.profile.id);
   } finally {
     glm52AutoSwitching = false;
   }
@@ -943,7 +998,7 @@ export const useStore = create<AppState>((set, get) => {
       for (const p of ordered) {
         await refreshQuota(p.id);
       }
-      await maybeSwitchGlm52Account(get());
+      await maybeSwitchGlm52Account(get);
     } finally {
       refreshAllInFlight = false;
       set((s) => ({ scheduledRefreshSeq: s.scheduledRefreshSeq + 1 }));
@@ -974,7 +1029,7 @@ export const useStore = create<AppState>((set, get) => {
         if (tryNoRestartSwitch && p.active) continue;
         await refreshQuota(p.id);
       }
-      await maybeSwitchGlm52Account(get());
+      await maybeSwitchGlm52Account(get);
     } finally {
       refreshAllInFlight = false;
     }
@@ -984,7 +1039,7 @@ export const useStore = create<AppState>((set, get) => {
     const active = get().profiles.find((p) => p.active);
     if (!active) return;
     await get().refreshQuota(active.id);
-    await maybeSwitchGlm52Account(get());
+    await maybeSwitchGlm52Account(get);
   },
 
   setAutoRefreshQuota: (v) => {
