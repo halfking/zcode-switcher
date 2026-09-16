@@ -246,7 +246,11 @@ const SET_SELECTED_KEY_SCRIPT: &str = r#"(async (targetKey) => {
     const isSvc = (o) => o && typeof o === 'object' &&
       o.settingService && typeof o.settingService.update === 'function' &&
       typeof o.settingService.get === 'function';
-    while (stack.length && count < 300000) {
+    // 80 万节点：实测 30 万 / 100-300ms 远低于 WS_TIMEOUT=3s；放宽到 80 万
+    // 给未来 ZCode 渲染树变深留 ~2.5x 余量，又不至于在 ZCode 渲染异常时
+    // 把整条 CDP 通道卡到超时。命中后不写缓存（极端情况下树结构本身已损坏，
+    // 缓存只会让后续切换全部失败）。
+    while (stack.length && count < 800000) {
       const node = stack.pop();
       count++;
       for (const slot of ['memoizedProps', 'memoizedState', 'pendingProps', 'stateNode', 'context']) {
