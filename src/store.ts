@@ -496,13 +496,9 @@ async function maybeSwitchGlm52Account(state: AppState) {
 
   if (state.glm52LowQuotaAction === "pause") {
     if (!currentLow) {
-      // 恢复：解除网关拦截与提示状态。
-      if (guardPauseNotified) {
-        guardPauseNotified = false;
-        state.toast(t.glmGuardResumed, "success");
-      }
-      if (state.autoSwitchPaused) state.setAutoSwitchPaused(false);
-      void api.setQuotaGuard(false, "").catch(() => {});
+      // 暂停模式要求等待人工操作：额度即使随后回升也不自动放行。
+      // 人工切号、关闭自动切换或切回“自动切换套餐/账号”模式时会清除
+      // QUOTA_GUARD；这样不会在低额度后静默恢复执行。
       return;
     }
     void api.setQuotaGuard(true, t.glmGuardReason).catch(() => {});

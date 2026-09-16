@@ -32,13 +32,16 @@ token 桶 / GLM Coding Plan 积分桶）只要其中之一低于阈值就切到�
      - `ensure_start_plan_entry_credentials`：切到 `start-plan` 入口
        时，若该入口无 API Key，把当前 credentials 里的
        `zcodejwttoken` 写进去（与切号流程同语义）。
-     - `switch_plan_internal`：先校验 `coding-plan` 入口必须存在 API
-       Key（没有就拒绝——切过去会让所有请求 401），再走两条切换路径：
+     - `switch_plan_internal`：切换到 Start Plan 时确保当前 credentials 里的
+       `zcodejwttoken` 已写入入口；随后走两条切换路径：
        1. **CDP 实时通道**（`zcode_cdp::try_update_selected_provider`）：
           通过渲染层 `settingService.update({...})` 让运行中的 ZCode
           立即路由到新套餐入口；
        2. **文件写入兜底**：patch `setting.json`，配
           `applied_live=false`，提示“需重启 ZCode 生效”。
+       Coding Plan 不以 config.json 的 API Key 快照作前置拒绝条件：该
+       Key 由 ZCode 在切换后按当前 OAuth 权益刷新，旧/过期快照不能用来
+       判断套餐是否实际可用。
    - `src-tauri/src/zcode_cdp.rs`
      - 新增 `try_update_selected_provider`：从 React fiber 树定位
        携带 `settingService.get/update` 的节点，缓存到

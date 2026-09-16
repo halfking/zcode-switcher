@@ -1389,40 +1389,10 @@ fn merge_selected_provider_key(
     serde_json::to_vec_pretty(&value).ok()
 }
 
-/// 读 config.json 里指定 provider 的 apiKey（空/缺失返回空串）。
-fn read_provider_api_key(provider_id: &str) -> String {
-    let Ok(path) = config_file() else {
-        return String::new();
-    };
-    let Ok(text) = fs::read_to_string(path) else {
-        return String::new();
-    };
-    let Ok(cfg) = serde_json::from_str::<Value>(&text) else {
-        return String::new();
-    };
-    cfg.get("provider")
-        .and_then(|p| p.get(provider_id))
-        .and_then(|p| p.get("options"))
-        .and_then(|o| o.get("apiKey"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string()
-}
-
 /// oauth 帐号切到 start-plan 入口时，若该入口没有 apiKey，把当前 credentials
 /// 里的 zcodejwttoken 写进去（与切号流程 prepare_config_provider_keys_update 同语义）。
 fn ensure_start_plan_entry_credentials(family: &str) -> R<()> {
     let entry_id = format!("builtin:{}-start-plan", family);
-    if !read_provider_api_key(&entry_id).is_empty() {
-        return Ok(());
-    }
-    let cred_bytes = fs::read(credentials_file()?)?;
-    let Some(jwt) = zcode_jwt_from_credentials(&cred_bytes)? else {
-        return Err(AppError::Msg(
-            "start-plan 入口缺少凭据，且 credentials.json 里没有可用的 zcodejwttoken".into(),
-        ));
-    };
     let path = config_file()?;
     let text = fs::read_to_string(&path)?;
     let mut cfg: Value = serde_json::from_str(&text)
@@ -1438,14 +1408,23 @@ fn ensure_start_plan_entry_credentials(family: &str) -> R<()> {
             entry_id
         )));
     };
-    if let Some(slot) = api_key.as_str() {
-        if slot.trim().is_empty() {
-            *api_key = Value::String(jwt);
-            let bytes = serde_json::to_vec_pretty(&cfg)?;
-            // 与切号一致：原地写让 ZCode 的文件监听识别为同文件修改。
-            write_in_place(&path, &bytes)?;
-        }
+    if api_key
+        .as_str()
+        .map(|slot| !slot.trim().is_empty())
+        .unwrap_or(false)
+    {
+        return Ok(());
     }
+    let cred_bytes = fs::read(credentials_file()?)?;
+    let Some(jwt) = zcode_jwt_from_credentials(&cred_bytes)? else {
+        return Err(AppError::Msg(
+            "start-plan 入口缺少凭据，且 credentials.json 里没有可用的 zcodejwttoken".into(),
+        ));
+    };
+    *api_key = Value::String(jwt);
+    let bytes = serde_json::to_vec_pretty(&cfg)?;
+    // 与切号一致：原地写让 ZCode 的文件监听识别为同文件修改。
+    write_in_place(&path, &bytes)?;
     Ok(())
 }
 
@@ -1458,19 +1437,17 @@ fn ensure_start_plan_entry_credentials(family: &str) -> R<()> {
 pub async fn switch_plan_internal(target: &str) -> Result<PlanSwitchOutcome, String> {
     let (selected_key, family) = plan_selected_key(target)?;
 
-    if target == "coding-plan" {
-        // coding-plan 入口走 open.bigmodel.cn 的 API Key 认证；没有 key 时
-        // 切过去只会让所有请求 401，必须拒绝。
-        let entry_id = format!("builtin:{}-coding-plan", family);
-        if read_provider_api_key(&entry_id).is_empty() {
-            return Err(format!(
-                "{} 入口没有 API Key（请先在 ZCode 中登录/领取 Coding Plan 后重试）",
-                entry_id
-            ));
-        }
-    } else {
+    if target.trim().eq_ignore_ascii_case("start-plan") {
+        // start-plan 入口必须带当前帐号的 zcodejwttoken；没有时补写，
+        // 与切号流程 prepare_config_provider_keys_update 同语义。
         ensure_start_plan_entry_credentials(&family).map_err(|e| e.to_string())?;
     }
+
+    // 不在这里拒绝 coding-plan 入口的空 API Key：ZCode 自身会在切换后的
+    // refreshCodingPlanApiKey 中按当前帐号 OAuth 权益刷新这把临时 Key。前置读取
+    // config.json 只是一个易过期的快照（尤其 token 已过期、后台刚清理缓存时），
+    // 用它拒绝会把“切回仍有效的 Coding Plan”错误挡住。服务端最终鉴权仍由
+    // ZCode 负责，失败时会显示官方的 entitlement/auth 错误。
 
     // 1. 实时路径：CDP settingService.update（内存 + 磁盘同时更新）。
     match crate::zcode_cdp::try_update_selected_provider(&selected_key).await {
