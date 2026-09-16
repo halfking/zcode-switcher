@@ -551,7 +551,6 @@ async function maybeSwitchGlm52Account(getStore: () => AppState) {
       if (Date.now() - lastPlanSwitchAttemptAt < cooldown) {
         return; // 冷却期内，等下一轮刷新复核
       }
-      lastPlanSwitchAttemptAt = Date.now();
       glm52AutoSwitching = true;
       let switched = false;
       try {
@@ -572,6 +571,10 @@ async function maybeSwitchGlm52Account(getStore: () => AppState) {
             target
         ) {
           if (getStore().busy) return; // 验证期间用户开始手动操作：不抢动作
+          // 冷却时间戳只在真正执行切换时记录：复核轮次（目标已耗尽/余额
+          // 已恢复）不消耗冷却，否则一次"复核不动"会把切套餐和切账号一起
+          // 阻塞一个冷却周期。
+          lastPlanSwitchAttemptAt = Date.now();
           state.toast(
             t.glmAutoSwitchingPlan.replace(
               "{plan}",

@@ -1,15 +1,15 @@
 {
-  "version": "1.1.16+45",
-  "notes": "1.1.16+45: 低额度自动切换的目标余额强制复核（切套餐/切账号前逐一用最新余额验证，全部不合格不切换）。详见 release/RELEASE_NOTES.md。",
-  "pub_date": "2026-09-17T04:10:00+08:00",
+  "version": "1.1.16+46",
+  "notes": "1.1.16+46: 低额度自动切换的目标余额逐一验证（防过期缓存误切）；审计修复套餐切换冷却被复核轮次误消耗。详见 release/RELEASE_NOTES.md。",
+  "pub_date": "2026-09-17T05:00:00+08:00",
   "platforms": {
     "windows-x86_64": {
       "signature": "",
-      "url": "https://github.com/halfking/zcode-switcher/releases/download/v1.1.16/ZCodeSwitcher-1.1.16+45-x64-setup.exe"
+      "url": "https://github.com/halfking/zcode-switcher/releases/download/v1.1.16/ZCodeSwitcher-1.1.16+46-x64-setup.exe"
     },
     "windows-aarch64": {
       "signature": "",
-      "url": "https://github.com/halfking/zcode-switcher/releases/download/v1.1.16/ZCodeSwitcher-1.1.16+45-arm64-setup.exe"
+      "url": "https://github.com/halfking/zcode-switcher/releases/download/v1.1.16/ZCodeSwitcher-1.1.16+46-arm64-setup.exe"
     }
   }
 }

@@ -1,192 +1,66 @@
-# 实现验证清单
+# 实现验证清单（1.1.16 低额度切换余额复核）
+
+> 本文件在 2026-09-17 审计时重写：旧版引用的 `shouldSwitchEntry` /
+> `tryAnotherEntry` / `findSwitchableCandidate` / `AutoSwitcherCard.tsx` /
+> `i18n/locales/*.json` 均与实际代码不符，已按真实实现修正。
 
 ## 代码实现确认
 
-### 1. 所有余额都到阈值才切换账号 ✅
+### 1. 目标余额强制复核（切套餐 + 切账号）✅
 
-**实现位置**：`src/lib/glm52.ts:151-163`
+**实现位置**：`src/store.ts` `maybeSwitchGlm52Account`（store 级布线）
++ `src/lib/quotaGuard.ts` `firstVerifiedTarget`（逐一验证助手）
++ `src/lib/glm52.ts` `isSwitchableCandidate`（双阈值合格判定）
 
-```typescript
-function isSwitchableCandidate(account: Glm52Account): boolean {
-  const hasToken = account.balance.token !== undefined;
-  const hasPoints = account.balance.points !== undefined;
-  
-  if (hasToken && account.balance.token! <= threshold.token) {
-    return false;
-  }
-  if (hasPoints && account.balance.points! <= threshold.points) {
-    return false;
-  }
-  
-  return hasToken || hasPoints;
-}
-```
-
-**验证**：该函数确保候选账号的所有量纲（token 和 points）都必须高于阈值。
+- 切套餐：执行 `switch_plan` 前重新拉取当前账号最新余额（`refreshQuota`），
+  复核当前入口仍低、且目标入口复核仍通过才执行；复核发现余额恢复则不动，
+  目标复核不合格则落入切账号流程。
+- 切账号：候选先用缓存余量排出验证顺序（`accountHeadroom` 降序），然后
+  逐一重新拉取最新余额复核，第一个通过双阈值的账号才成为目标；全部不通过
+  则进入自动暂停（`autoSwitchPaused`），不做任何切换。
+- 后端数据源：`profile.rs` 的 `fetch_quota(Some(id))` 读取**目标档案自己的
+  凭据副本**查询余额，保证验证的是目标账号的真实余额。
 
 ### 2. 套餐内切换优先 ✅
 
-**实现位置**：`src/lib/store.ts:528-633`
+**实现位置**：`src/store.ts`（第 1 步）+ `src/lib/quotaGuard.ts`
+`pickPlanSwitchTarget` / `isCurrentEntryLow` / `entryHealth`
 
-**切换逻辑顺序**：
-1. 检测当前入口余额不足（`shouldSwitchEntry`）
-2. 尝试切换到同账号的另一个套餐入口（`tryAnotherEntry`）
-3. 如果套餐内切换失败，才查找候选账号（`findSwitchableCandidate`）
-4. 切换到候选账号或暂停执行
-
-```typescript
-// 步骤 1: 检查是否需要切换
-const needSwitch = shouldSwitchEntry(currentState.account, entry, lowQuotaAction === "switch");
-
-// 步骤 2: 尝试套餐内切换
-if (needSwitch) {
-  const switched = await tryAnotherEntry(currentState.account, entry);
-  if (switched) return; // 套餐内切换成功，直接返回
-  
-  // 步骤 3: 套餐内切换失败，查找候选账号
-  const candidate = findSwitchableCandidate(currentState.account.id, accountList);
-  if (candidate) {
-    // 步骤 4a: 切换账号
-    await switchTo(candidate);
-  } else {
-    // 步骤 4b: 暂停执行
-    await api.setQuotaGuard(true);
-  }
-}
-```
+当前入口低于阈值时先切同账号的另一个入口（Start Plan ↔ Coding Plan）；
+入口不可识别（`active_provider` 缺失/非法）或另一入口不可评估时跳过切套餐，
+直接进入切账号判定。
 
 ### 3. 暂停执行模式 ✅
 
-**实现位置**：`src/lib/store.ts:497-513`
+**实现位置**：`src/store.ts`（`glm52LowQuotaAction === "pause"` 分支）
 
-```typescript
-if (lowQuotaAction === "pause") {
-  await api.setQuotaGuard(true); // 启用网关拦截
-  showToast(`${entry.label} 余额低于阈值，已暂停`, "warning");
-  return;
-}
-```
+低于阈值时 `setQuotaGuard(true)` 让本地网关拦截模型请求并停止一切自动切换；
+配置持久化在 localStorage `zcs:glm52LowQuotaAction`，默认 `"switch"`。
+切换模式下复核不合格进入的是 `autoSwitchPaused`（语义："所有账号均低于
+阈值"），与网关拦截的暂停模式相互独立。
 
-**配置存储**：`src/lib/store.ts:42,94`
-- 字段：`glm52LowQuotaAction: "switch" | "pause"`
-- 默认值：`"switch"`
-- LocalStorage 键：`zcs:glm52LowQuotaAction`
+### 4. 关键护栏 ✅
 
-### 4. UI 控件 ✅
+- `isSwitchableCandidate`：候选已知的每个量纲必须**严格高于**阈值且至少
+  一个量纲有数据；无数据/拉取出错的账号一律不合格（保守不切）。
+- `switch_plan` 抛错（典型：coding-plan 入口缺 API Key）视同该入口耗尽，
+  落入切账号流程；失败后进入 10 分钟长冷却。
+- 套餐切换冷却时间戳只在**真正执行** `switchPlan` 时记录；复核轮次
+  （目标已耗尽/余额已恢复）不消耗冷却（2026-09-17 审计修复）。
+- 执行切换前检查 `busy`，验证期间用户开始手动操作则不抢动作。
 
-**实现位置**：`src/components/AutoSwitcherCard.tsx:240-258`
+## 自动化回归
 
-```tsx
-<div className="form-control">
-  <label className="label cursor-pointer justify-start gap-2">
-    <input
-      type="radio"
-      name="low-quota-action"
-      className="radio radio-primary radio-sm"
-      checked={lowQuotaAction === "switch"}
-      onChange={() => setLowQuotaAction("switch")}
-    />
-    <span className="label-text">{t("lowQuotaActionSwitch")}</span>
-  </label>
-  <label className="label cursor-pointer justify-start gap-2">
-    <input
-      type="radio"
-      name="low-quota-action"
-      className="radio radio-primary radio-sm"
-      checked={lowQuotaAction === "pause"}
-      onChange={() => setLowQuotaAction("pause")}
-    />
-    <span className="label-text">{t("lowQuotaActionPause")}</span>
-  </label>
-</div>
-```
+| 命令 | 覆盖 |
+|---|---|
+| `npm run test:quotaguard` | quotaGuard 纯函数 9 项：入口判定回退、pickPlanSwitchTarget、firstVerifiedTarget 逐一验证语义 |
+| `npm run test:autoswitch` | store 布线 4 场景：S1 逐一验证选首个合格者、S2 全部不合格暂停、S3S4 复核不动+不消耗冷却、S5 切套餐失败落入切号 |
+| `npm run test:settings` | 设置面板 macOS launcher 开关（轮询等待，无偶发失败） |
+| `npm run test:windows` | 实机回归（版本/会话/凭据加密形态/CDP） |
 
-### 5. 国际化文本 ✅
+## 部署状态
 
-**实现位置**：`src/i18n/locales/*.json`
-
-中文：
-- `lowQuotaActionLabel`: "余额低时"
-- `lowQuotaActionSwitch`: "自动切换套餐/账号"
-- `lowQuotaActionPause`: "暂停执行"
-
-英文：
-- `lowQuotaActionLabel`: "When balance is low"
-- `lowQuotaActionSwitch`: "Auto switch plan/account"
-- `lowQuotaActionPause`: "Pause execution"
-
-## 关键函数分析
-
-### `shouldSwitchEntry(account, entry, autoSwitch)`
-
-**位置**：`src/lib/store.ts:536-559`
-
-**作用**：判断当前入口是否需要切换
-
-**逻辑**：
-- 如果未启用自动切换，返回 `false`
-- 如果当前入口余额充足，返回 `false`
-- 如果当前入口余额不足（任一量纲低于阈值），返回 `true`
-
-### `tryAnotherEntry(account, currentEntry)`
-
-**位置**：`src/lib/store.ts:561-591`
-
-**作用**：尝试切换到同账号的另一个套餐入口
-
-**逻辑**：
-1. 获取当前账号的所有入口
-2. 过滤掉当前入口
-3. 查找余额充足的备选入口（所有量纲都高于阈值）
-4. 如果找到，切换并返回 `true`
-5. 否则返回 `false`
-
-### `findSwitchableCandidate(currentAccountId, accounts)`
-
-**位置**：`src/lib/store.ts:593-609`
-
-**作用**：查找可切换的候选账号
-
-**逻辑**：
-1. 过滤掉当前账号
-2. 使用 `isSwitchableCandidate` 检查每个账号
-3. 返回第一个符合条件的账号（所有量纲都高于阈值）
-
-## 测试要点
-
-1. **套餐内切换优先**：
-   - 账号 A 有两个套餐：Start Plan（余额不足）和 Coding Plan（余额充足）
-   - 预期：切换到 Coding Plan，而不是切换到账号 B
-
-2. **所有余额都达阈值才切换账号**：
-   - 账号 B：token 充足，但 points 不足
-   - 账号 C：token 和 points 都充足
-   - 预期：跳过账号 B，切换到账号 C
-
-3. **暂停模式拦截请求**：
-   - 设置为暂停模式
-   - 当前账号所有套餐余额都不足
-   - 预期：调用 `setQuotaGuard(true)`，网关拦截请求
-
-4. **切换模式不拦截**：
-   - 设置为切换模式
-   - 有可用的候选账号
-   - 预期：自动切换，不调用 `setQuotaGuard(true)`
-
-## 部署验证步骤
-
-1. ✅ 代码已实现所有功能
-2. ⏳ 正在构建应用
-3. ⏳ 安装新版本
-4. ⏳ 按测试计划执行测试
-5. ⏳ 验证所有场景通过
-
-## 当前状态
-
-- [x] 代码实现完成
-- [x] UI 控件添加
-- [x] 国际化文本添加
-- [x] 测试计划编写
-- [ ] 应用构建（进行中）
-- [ ] 部署测试
-- [ ] 功能验证
+- [x] 代码实现完成（含 2026-09-17 审计修复）
+- [x] 自动化回归通过（见上）
+- [x] 1.1.16+45 已构建并静默安装，实机回归 9/10（唯一 FAIL 为环境 CDP 状态）
+- [x] 审计修复后重新构建部署 1.1.16+46：静默安装 + 实机回归 9/10（唯一 FAIL 为环境 CDP 状态）

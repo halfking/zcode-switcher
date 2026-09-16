@@ -1,18 +1,18 @@
-# ZCode Switcher 1.1.16+45 Release
+# ZCode Switcher 1.1.16+46 Release
 
-发布于 2026-09-17。本地构建产物（`npm run tauri build`，build.count=45），
+发布于 2026-09-17。本地构建产物（`npm run tauri build`，build.count=46），
 已在构建机上完成真机部署验证。
 
 ## 产物
 
 | 文件 | 大小 | SHA-256 |
 |---|---|---|
-| `ZCodeSwitcher-1.1.16+45-x64-setup.exe` | 4.0 MB | `69921e7ac26089e697d68f3e4a9c444db3e1fdad5a4deeb86267ab8a8c3d905b` |
+| `ZCodeSwitcher-1.1.16+46-x64-setup.exe` | 4.0 MB | `34a65f11a4b45893f927ccb4040e598a1bf40da2bfeb1e4b7f6e6b6e6e369e5a` |
 | `latest.json` | – | Tauri updater 清单（本地构建无签名） |
 | `SHA256SUMS.txt` | – | 上述 sha256 |
 
-注：tauri 打包目录里的原始文件名带 stamp 前值（`+44`），安装后的 exe
-元数据为 `1.1.16+45`，发布产物按安装后版本命名。`+N` 为 semver 构建
+注：tauri 打包目录里的原始文件名带 stamp 前值（`+45`），安装后的 exe
+元数据为 `1.1.16+46`，发布产物按安装后版本命名。`+N` 为 semver 构建
 元数据，自动更新只比较 `1.1.16`。
 
 ## 本版更新（摘自 `docs/changelog.md`）
@@ -31,7 +31,7 @@
 ## 真机验证（2026-09-17，构建机）
 
 - 静默安装（NSIS `/S`）覆盖 1.1.15+43 成功，exe 元数据
-  `ProductVersion = 1.1.16+45`。
+  `ProductVersion = 1.1.16+46`。
 - `windows-regression.ps1 -ExpectedVersion 1.1.16`：9/10 通过
   （版本 / 会话归属 / 进程 / credentials 加密形态 / 档案快照全部 PASS）。
 - 唯一 FAIL 项 `zcode.cdp`（9229 端口）为环境状态：验证时机上 ZCode 由
