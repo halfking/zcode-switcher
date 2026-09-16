@@ -142,30 +142,39 @@ pub async fn fetch_quota(creds_text: &str) -> Result<QuotaInfo, String> {
     // 3. mcp/usage 汇总桶 —— 仅兜底：total_usage 是服务端滞后缓存
     //    （实测长时间停留在 used=0），不能反映 5 小时窗口的真实用量。
     let mut coding: Option<CodingPlanSnapshot> = None;
+    // 记录积分链路的最后一次失败原因：积分是部分账号（billing 返回空）的
+    // 唯一额度来源，全部来源失败时错误信息必须能指明原因（如 401 过期），
+    // 否则只报泛化的"未返回额度明细"，无法排查。
+    let mut coding_error: Option<String> = None;
 
-    if let Ok(oauth_token) = oauth_access_token(&creds) {
-        if let Ok(snapshot) = fetch_coding_plan_usage(&client, &oauth_token).await {
-            coding = Some(snapshot);
-        }
+    match oauth_access_token(&creds) {
+        Ok(oauth_token) => match fetch_coding_plan_usage(&client, &oauth_token).await {
+            Ok(snapshot) => coding = Some(snapshot),
+            Err(e) => coding_error = Some(e),
+        },
+        Err(e) => coding_error = Some(e),
     }
     if coding.is_none() {
         let coding_key = read_bigmodel_provider_key("builtin:bigmodel-coding-plan");
         let start_key = read_bigmodel_provider_key("builtin:bigmodel-start-plan");
         if let Some(key) = coding_key {
-            coding = fetch_coding_plan_usage(&client, &key).await.ok();
+            match fetch_coding_plan_usage(&client, &key).await {
+                Ok(snapshot) => coding = Some(snapshot),
+                Err(e) => coding_error = Some(e),
+            }
         }
-        if let Some(key) = start_key {
-            if let Ok(start) = fetch_coding_plan_usage(&client, &key).await {
-                match &mut coding {
-                    Some(c) => c.items.extend(start.items),
-                    None => coding = Some(start),
+        if coding.is_none() {
+            if let Some(key) = start_key {
+                if let Ok(start) = fetch_coding_plan_usage(&client, &key).await {
+                    coding = Some(start);
                 }
             }
         }
     }
     if coding.is_none() {
-        if let Ok(mcp) = fetch_mcp_usage(&client, &token, &creds).await {
-            coding = Some(mcp);
+        match fetch_mcp_usage(&client, &token, &creds).await {
+            Ok(mcp) => coding = Some(mcp),
+            Err(e) => coding_error = Some(e),
         }
     }
 
@@ -229,7 +238,10 @@ pub async fn fetch_quota(creds_text: &str) -> Result<QuotaInfo, String> {
     if balances.is_empty() {
         return Err(match billing_error {
             Some(e) => format!("套餐额度刷新失败：{}", friendly_balance_error(Some(&e))),
-            None => "额度接口未返回可显示的模型额度明细".into(),
+            None => match coding_error {
+                Some(e) => format!("积分额度获取失败：{}", e),
+                None => "额度接口未返回可显示的模型额度明细".into(),
+            },
         });
     }
 
@@ -486,13 +498,17 @@ fn parse_coding_plan_usage(value: &Value) -> Option<CodingPlanSnapshot> {
         if limit_type != "CREDIT_LIMIT" && limit_type != "TIME_LIMIT" {
             continue;
         }
-        let total = limit.get("usage").and_then(Value::as_f64)?;
-        let used = limit.get("currentValue").and_then(Value::as_f64)?;
-        let remaining = limit.get("remaining").and_then(Value::as_f64);
-        if !total.is_finite() || total <= 0.0 {
-            continue;
-        }
-        let remaining = match remaining {
+        // 单条目字段缺失只跳过该条，不能让整个快照解析失败——否则会静默
+        // 跌落到滞后的 mcp/usage 汇总兜底，界面显示反而退回假数据。
+        let total = match limit.get("usage").and_then(Value::as_f64) {
+            Some(v) if v.is_finite() && v > 0.0 => v,
+            _ => continue,
+        };
+        let used = match limit.get("currentValue").and_then(Value::as_f64) {
+            Some(v) if v.is_finite() => v,
+            _ => continue,
+        };
+        let remaining = match limit.get("remaining").and_then(Value::as_f64) {
             Some(v) if v.is_finite() => v,
             _ => (total - used).max(0.0),
         };
@@ -1366,6 +1382,24 @@ mod tests {
             .map(|item| item.remaining_units)
             .fold(f64::INFINITY, f64::min);
         assert_eq!(min_point, 100.0);
+    }
+
+    #[test]
+    fn parse_coding_plan_usage_skips_malformed_entries_not_whole_snapshot() {
+        // 一条缺 usage/currentValue 的坏条目只应跳过自身；整快照被丢弃会
+        // 静默跌落到滞后的 mcp/usage 汇总兜底（回归防护）。
+        let value: Value = serde_json::from_str(
+            r#"{"code":200,"success":true,"data":{"limits":[
+                {"type":"CREDIT_LIMIT","unit":6,"number":1,"currentValue":100},
+                {"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":28000,"currentValue":2566,"remaining":25434},
+                {"type":"TIME_LIMIT","unit":5,"number":1}
+            ],"level":"max"}}"#,
+        )
+        .unwrap();
+        let snapshot = parse_coding_plan_usage(&value).expect("好条目存在时应解析成功");
+        assert_eq!(snapshot.items.len(), 1);
+        assert_eq!(snapshot.items[0].show_name, "5小时积分");
+        assert_eq!(snapshot.items[0].remaining_units, 25434.0);
     }
 
     #[test]
