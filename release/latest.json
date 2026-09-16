@@ -1,15 +1,15 @@
 {
-  "version": "1.1.15+43",
-  "notes": "1.1.15+43: 托盘双图标修复 + 重复账号自动合并 + 版本号引入编译次数。详见 release/RELEASE_NOTES.md。",
-  "pub_date": "2026-09-17T01:50:00+08:00",
+  "version": "1.1.16+45",
+  "notes": "1.1.16+45: 低额度自动切换的目标余额强制复核（切套餐/切账号前逐一用最新余额验证，全部不合格不切换）。详见 release/RELEASE_NOTES.md。",
+  "pub_date": "2026-09-17T04:10:00+08:00",
   "platforms": {
     "windows-x86_64": {
       "signature": "",
-      "url": "https://github.com/halfking/zcode-switcher/releases/download/v1.1.15/ZCodeSwitcher-1.1.15+43-x64-setup.exe"
+      "url": "https://github.com/halfking/zcode-switcher/releases/download/v1.1.16/ZCodeSwitcher-1.1.16+45-x64-setup.exe"
     },
     "windows-aarch64": {
       "signature": "",
-      "url": "https://github.com/halfking/zcode-switcher/releases/download/v1.1.15/ZCodeSwitcher-1.1.15+43-arm64-setup.exe"
+      "url": "https://github.com/halfking/zcode-switcher/releases/download/v1.1.16/ZCodeSwitcher-1.1.16+45-arm64-setup.exe"
     }
   }
 }

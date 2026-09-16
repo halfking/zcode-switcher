@@ -6343,7 +6343,7 @@ dependencies = [
 
 [[package]]
 name = "zcode-switcher"
-version = "1.1.15+43"
+version = "1.1.16+45"
 dependencies = [
  "aes-gcm",
  "anyhow",

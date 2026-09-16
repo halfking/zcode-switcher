@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 .SYNOPSIS
     zcode-switcher Windows 实机回归检查（在真实登录用户的桌面会话中运行）。
@@ -6,7 +6,7 @@
 .DESCRIPTION
     覆盖跨平台凭据迁移（commit 3dfc58c）之后必须在真实用户会话里验证的项目：
 
-      1. 已安装的 zcode-switcher.exe 版本（默认期望 1.1.14）。
+      1. 已安装的 zcode-switcher.exe 版本（默认期望 1.1.16）。
       2. Switcher 与 ZCode 进程运行在交互登录用户（console 会话）下，而不是 SYSTEM。
       3. ~/.zcode/v2/credentials.json 存在、可解析，敏感字符串字段为 enc:v1: 密文。
       4. Switcher 账号池 profiles.json 可读，且每个档案的凭据副本均为 enc:v1: 密文。
@@ -21,10 +21,10 @@
     powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows-regression.ps1
 
 .EXAMPLE
-    powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows-regression.ps1 -ExpectedVersion 1.1.15
+    powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows-regression.ps1 -ExpectedVersion 1.1.16
 #>
 param(
-    [string]$ExpectedVersion = "1.1.15",
+    [string]$ExpectedVersion = "1.1.16",
     [int]$CdpPort = 9229
 )
 
