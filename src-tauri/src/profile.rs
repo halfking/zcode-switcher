@@ -1494,8 +1494,16 @@ pub async fn switch_plan_internal(target: &str) -> Result<PlanSwitchOutcome, Str
     } else {
         "{}".to_string()
     };
-    let bytes = merge_selected_provider_key(&text, &family, &selected_key)
-        .ok_or_else(|| format!("selected key 已是 {}", selected_key))?;
+    let bytes = merge_selected_provider_key(&text, &family, &selected_key);
+    if bytes.is_none() {
+        // ZCode 未运行时 CDP 不可用；若配置已经指向目标入口，幂等地
+        // 返回成功（当前进程若不存在，下一次启动会读取这份正确配置）。
+        return Ok(PlanSwitchOutcome {
+            selected_key,
+            applied_live: false,
+        });
+    }
+    let bytes = bytes.expect("checked is_some above");
     if setting_path.exists() {
         // 与切号流程一致：先留一份带时间戳的备份。
         if let Ok(backup_dir_path) = backup_dir() {
