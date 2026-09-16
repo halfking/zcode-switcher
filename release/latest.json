@@ -1,15 +1,15 @@
 {
-  "version": "1.1.14",
-  "notes": "1.1.14: 套餐优先自动切换 + 暂停模式 + 真机自测命令 + 审计修正。详见 release/RELEASE_NOTES.md。",
-  "pub_date": "2026-09-16T17:50:27+08:00",
+  "version": "1.1.15+43",
+  "notes": "1.1.15+43: 托盘双图标修复 + 重复账号自动合并 + 版本号引入编译次数。详见 release/RELEASE_NOTES.md。",
+  "pub_date": "2026-09-17T01:50:00+08:00",
   "platforms": {
     "windows-x86_64": {
       "signature": "",
-      "url": "https://github.com/halfking/zcode-switcher/releases/download/v1.1.14/ZCodeSwitcher-1.1.14-x64-setup.exe"
+      "url": "https://github.com/halfking/zcode-switcher/releases/download/v1.1.15/ZCodeSwitcher-1.1.15+43-x64-setup.exe"
     },
     "windows-aarch64": {
       "signature": "",
-      "url": "https://github.com/halfking/zcode-switcher/releases/download/v1.1.14/ZCodeSwitcher-1.1.14-arm64-setup.exe"
+      "url": "https://github.com/halfking/zcode-switcher/releases/download/v1.1.15/ZCodeSwitcher-1.1.15+43-arm64-setup.exe"
     }
   }
 }

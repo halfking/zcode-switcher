@@ -399,8 +399,9 @@ export default function SettingsPanel() {
   >(null);
 
   useEffect(() => {
+    // appVersion 形如 "1.1.15+43"（版本号+编译次数，见 scripts/stamp-build.mjs）。
     getVersion()
-      .then((appVersion) => setVersion(`v ${appVersion}`))
+      .then((appVersion) => setVersion(`v${appVersion}`))
       .catch(() => {});
   }, []);
 

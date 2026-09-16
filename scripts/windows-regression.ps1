@@ -21,10 +21,10 @@
     powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows-regression.ps1
 
 .EXAMPLE
-    powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows-regression.ps1 -ExpectedVersion 1.1.14
+    powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows-regression.ps1 -ExpectedVersion 1.1.15
 #>
 param(
-    [string]$ExpectedVersion = "1.1.14",
+    [string]$ExpectedVersion = "1.1.15",
     [int]$CdpPort = 9229
 )
 
@@ -90,7 +90,9 @@ Write-Output ("USERPROFILE: {0}" -f $env:USERPROFILE)
 $switcherExe = Join-Path $env:LOCALAPPDATA 'ZCode Switcher\zcode-switcher.exe'
 if (Test-Path $switcherExe) {
     $installed = (Get-Item $switcherExe).VersionInfo.ProductVersion
-    if ($installed -eq $ExpectedVersion) {
+    # 版本号带编译次数（如 1.1.15+43），ProductVersion 可能是元数据截断后的 1.1.15.0，
+    # 所以按前缀匹配而不是全等。
+    if ($installed -like "$ExpectedVersion*") {
         Write-Pass 'switcher.version' ("{0} ({1})" -f $installed, $switcherExe)
     } else {
         Write-Fail 'switcher.version' ("installed={0} expected={1} ({2})" -f $installed, $ExpectedVersion, $switcherExe)

@@ -621,8 +621,35 @@ fn identity_key(email: &str, phone: &str, user_id: &str) -> Option<String> {
     None
 }
 
-fn profile_identity_key(profile: &Profile) -> Option<String> {
-    identity_key(&profile.email, &profile.phone, &profile.user_id)
+/// 某账号的**全部**身份信号（非空即收）：`email:*` / `phone:*` / `uid:*`。
+///
+/// identity_key 只取优先级最高的一个字段做唯一键；同一账号"一行存了邮箱、
+/// 另一行只有 user_id"时两个键不同，单键匹配会漏判重复（档案库真实发生过）。
+/// 匹配/去重一律用信号全集：任一信号重叠即视为同一账号。
+fn identity_signals(email: &str, phone: &str, user_id: &str) -> Vec<String> {
+    let mut out = Vec::with_capacity(3);
+    let email = normalize_email(email);
+    if !email.is_empty() {
+        out.push(format!("email:{}", email));
+    }
+    let phone = normalize_phone(phone);
+    if !phone.is_empty() {
+        out.push(format!("phone:{}", phone));
+    }
+    let user_id = user_id.trim();
+    if !user_id.is_empty() {
+        out.push(format!("uid:{}", user_id));
+    }
+    out
+}
+
+fn profile_identity_signals(profile: &Profile) -> Vec<String> {
+    identity_signals(&profile.email, &profile.phone, &profile.user_id)
+}
+
+/// 两组身份信号是否共享任一信号（双方非空才可能重叠）。
+fn signals_overlap(a: &[String], b: &[String]) -> bool {
+    !a.is_empty() && !b.is_empty() && a.iter().any(|s| b.contains(s))
 }
 
 /// 原子写入：先写 .tmp 再 rename，避免写一半导致文件损坏。
@@ -694,14 +721,33 @@ fn current_identity() -> Option<AccountIdentity> {
     Some(extract_identity_from_credentials(&cred_bytes))
 }
 
+/// 在档案列表中按身份信号（email/phone/user_id 任一重叠）找档案下标。
+fn find_profile_index_by_signals(
+    profiles: &[Profile],
+    email: &str,
+    phone: &str,
+    user_id: &str,
+) -> Option<usize> {
+    let signals = identity_signals(email, phone, user_id);
+    if signals.is_empty() {
+        return None;
+    }
+    profiles
+        .iter()
+        .position(|p| signals_overlap(&profile_identity_signals(p), &signals))
+}
+
 fn find_profile_by_identity<'a>(
     profiles: &'a [Profile],
     identity: &AccountIdentity,
 ) -> Option<&'a Profile> {
-    let key = identity.key()?;
-    profiles
-        .iter()
-        .find(|p| profile_identity_key(p).as_deref() == Some(key.as_str()))
+    let idx = find_profile_index_by_signals(
+        profiles,
+        &identity.email,
+        &identity.phone,
+        &identity.user_id,
+    )?;
+    Some(&profiles[idx])
 }
 
 /// 当前 credentials.json 内容的 SHA256，用来判定"当前正在使用的账号快照"。
@@ -712,70 +758,204 @@ fn current_cred_hash() -> Option<String> {
     Some(sha256_bytes(&bytes))
 }
 
-/// 写盘前按身份键去重（macOS/Windows/Linux 共用同一份逻辑）。
+/// 写盘前按身份信号去重合并（macOS/Windows/Linux 共用同一份逻辑）。
 ///
-/// 同一身份（email→phone→user_id）的重复档案只保留一条，优先级：
+/// 两个档案只要共享任一身份信号（email/phone/user_id，见 identity_signals）
+/// 即视为同一账号，用并查集把传递重叠的档案归入同组。同组重复档案按优先级
+/// 选主，其余档案的空缺字段并入主档案后删除：
 ///   1. `cred_hash` 与当前 credentials.json 一致（即"当前正在使用"的快照）
 ///   2. `updated_at` 最大（最近使用）
 ///   3. `created_at` 最小（先建立的）
 ///
-/// 背景：新写入路径本就按身份去重（capture_current / import），但磁盘上仍可能
-/// 残留重复记录：旧版本迁移（去重逻辑加入之前）、手工编辑 profiles.json、
-/// 同一账号一行存了邮箱另一行只有 user_id（identity_key 取值不同导致漏判）。
-/// 每次写盘前统一清扫一遍，保证档案库收敛到无重复。
+/// 背景：新写入路径本就按身份信号匹配（capture_current / import），但磁盘上
+/// 仍可能残留重复记录：旧版本按单一身份键去重（同一账号一行存了邮箱另一行
+/// 只有 user_id，identity_key 取值不同导致漏判，档案库真实发生过）、手工编辑
+/// profiles.json。每次写盘前统一清扫一遍，启动时另有 migrate_merge_duplicates
+/// 主动收敛一次，保证档案库收敛到无重复。
 ///
-/// 注：同组重复档案的身份键必然相同，"是否匹配 live identity key"在组内要么
-/// 全真要么全假，无法排序；所以"当前在用"用 cred_hash 与 live credentials.json
-/// 的哈希比对来判定（切号/捕获刚写完盘时，被操作的档案必然命中第 1 优先级）。
-fn dedup_before_save(profiles: &mut Vec<Profile>, live_cred_hash: Option<&str>) {
-    let mut groups: std::collections::BTreeMap<String, Vec<usize>> =
+/// 返回被合并掉的档案，调用方（迁移）可对其凭据副本做备份。
+fn dedup_before_save(profiles: &mut Vec<Profile>, live_cred_hash: Option<&str>) -> Vec<Profile> {
+    let n = profiles.len();
+    let signals: Vec<Vec<String>> = profiles.iter().map(profile_identity_signals).collect();
+
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn root(parent: &[usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            i = parent[i];
+        }
+        i
+    }
+    for i in 0..n {
+        for j in 0..i {
+            if signals_overlap(&signals[i], &signals[j]) {
+                let (ri, rj) = (root(&parent, i), root(&parent, j));
+                if ri != rj {
+                    // 统一挂到较小根上，保证分组确定性。
+                    parent[ri.max(rj)] = ri.min(rj);
+                }
+            }
+        }
+    }
+    let mut groups: std::collections::BTreeMap<usize, Vec<usize>> =
         std::collections::BTreeMap::new();
-    for (idx, p) in profiles.iter().enumerate() {
-        if let Some(k) = profile_identity_key(p) {
-            groups.entry(k).or_default().push(idx);
+    for (i, sig) in signals.iter().enumerate() {
+        if !sig.is_empty() {
+            groups.entry(root(&parent, i)).or_default().push(i);
         }
     }
 
-    let mut drop: Vec<usize> = groups
-        .into_values()
-        .filter(|group| group.len() > 1)
-        .flat_map(|group| {
-            let mut ranked = group;
-            ranked.sort_by(|&a, &b| {
-                let live_a = live_cred_hash == Some(profiles[a].cred_hash.as_str());
-                let live_b = live_cred_hash == Some(profiles[b].cred_hash.as_str());
-                live_b
-                    .cmp(&live_a)
-                    .then_with(|| {
-                        profiles[b]
-                            .updated_at
-                            .partial_cmp(&profiles[a].updated_at)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .then_with(|| {
-                        profiles[a]
-                            .created_at
-                            .partial_cmp(&profiles[b].created_at)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-            });
-            ranked.into_iter().skip(1)
-        })
-        .collect();
+    let mut drop: Vec<usize> = Vec::new();
+    for group in groups.into_values().filter(|group| group.len() > 1) {
+        let mut ranked = group;
+        ranked.sort_by(|&a, &b| {
+            let live_a = live_cred_hash == Some(profiles[a].cred_hash.as_str());
+            let live_b = live_cred_hash == Some(profiles[b].cred_hash.as_str());
+            live_b
+                .cmp(&live_a)
+                .then_with(|| {
+                    profiles[b]
+                        .updated_at
+                        .partial_cmp(&profiles[a].updated_at)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| {
+                    profiles[a]
+                        .created_at
+                        .partial_cmp(&profiles[b].created_at)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+        // 主档案（ranked[0]）吸收其余档案的空缺字段，再丢弃它们。
+        let (winner, losers) = ranked.split_first().expect("分组非空");
+        for &loser in losers {
+            let donor = profiles[loser].clone();
+            merge_profile_fields(&mut profiles[*winner], &donor);
+        }
+        drop.extend_from_slice(losers);
+    }
     drop.sort_unstable();
 
+    let mut removed: Vec<Profile> = Vec::with_capacity(drop.len());
     for idx in drop.into_iter().rev() {
-        let removed = profiles.remove(idx);
-        // 同身份重复档案的 id 是身份哈希，可能共享同一个 cred_file；
-        // 只有当没有任何幸存档案还引用它时才删文件，避免把在用的凭据副本删掉。
+        let dropped = profiles.remove(idx);
+        // 同身份重复档案的 cred_file 可能不同；只有当没有任何幸存档案还引用
+        // 同名文件时才删文件，避免把在用的凭据副本删掉。
         let still_referenced = profiles
             .iter()
-            .any(|p| !p.cred_file.is_empty() && p.cred_file == removed.cred_file);
-        if !removed.cred_file.is_empty() && !still_referenced {
+            .any(|p| !p.cred_file.is_empty() && p.cred_file == dropped.cred_file);
+        if !dropped.cred_file.is_empty() && !still_referenced {
             if let Ok(dir) = profiles_dir() {
-                let _ = fs::remove_file(dir.join(&removed.cred_file));
+                let _ = fs::remove_file(dir.join(&dropped.cred_file));
             }
         }
+        removed.push(dropped);
+    }
+    removed
+}
+
+/// 把 donor 档案的空缺字段/缺失的 apiKey 快照并入 winner（不覆盖 winner 已有值）。
+/// 不动 id / cred_file / cred_hash / 时间戳：主档案凭它的凭据副本切号，身份哈希
+/// 改了会破坏凭据文件对应关系。
+fn merge_profile_fields(winner: &mut Profile, donor: &Profile) {
+    if winner.name.trim().is_empty() {
+        winner.name = donor.name.clone();
+    }
+    if winner.email.is_empty() {
+        winner.email = donor.email.clone();
+    }
+    if winner.phone.is_empty() {
+        winner.phone = donor.phone.clone();
+    }
+    if winner.user_id.is_empty() {
+        winner.user_id = donor.user_id.clone();
+    }
+    if winner.avatar.is_empty() {
+        winner.avatar = donor.avatar.clone();
+    }
+    if winner.family.is_empty() {
+        winner.family = donor.family.clone();
+    }
+    if winner.mode.is_empty() {
+        winner.mode = donor.mode.clone();
+    }
+    for (key, value) in &donor.provider_api_keys {
+        winner
+            .provider_api_keys
+            .entry(key.clone())
+            .or_insert_with(|| value.clone());
+    }
+}
+
+/// 磁盘上是否存在共享任一身份信号的重复档案（迁移用，无重复不做事）。
+fn has_identity_duplicates(profiles: &[Profile]) -> bool {
+    let signals: Vec<Vec<String>> = profiles.iter().map(profile_identity_signals).collect();
+    for i in 0..signals.len() {
+        for j in 0..i {
+            if signals_overlap(&signals[i], &signals[j]) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 启动迁移：把历史版本漏判产生的重复账号档案自动合并一次。
+///
+/// 先把索引和将被合并掉的凭据副本备份到 account-backups/ 再写盘；任何失败
+/// 只记日志，不阻断启动。去重逻辑与写盘路径共用 dedup_before_save。
+pub fn migrate_merge_duplicates() {
+    let Ok(index_path) = profiles_index() else {
+        return;
+    };
+    if !index_path.exists() {
+        return;
+    }
+    let profiles = load_index();
+    if profiles.len() < 2 || !has_identity_duplicates(&profiles) {
+        return;
+    }
+
+    let stamp = now_ts() as u64;
+    let backup_ok = (|| -> R<()> {
+        let dir = backup_dir()?;
+        fs::create_dir_all(&dir)?;
+        fs::copy(
+            &index_path,
+            dir.join(format!("profiles.pre-merge.{stamp}.json")),
+        )?;
+        let src_dir = profiles_dir()?;
+        for profile in &profiles {
+            if profile.cred_file.is_empty() {
+                continue;
+            }
+            let src = src_dir.join(&profile.cred_file);
+            if src.exists() {
+                let name = format!(
+                    "{}.pre-merge.{stamp}.json",
+                    profile.cred_file.trim_end_matches(".json")
+                );
+                fs::copy(&src, dir.join(name))?;
+            }
+        }
+        Ok(())
+    })();
+    if let Err(e) = backup_ok {
+        eprintln!("[migrate] 合并前备份失败，跳过自动合并: {e}");
+        return;
+    }
+
+    let mut profiles = load_index();
+    let live_hash = current_cred_hash();
+    let removed = dedup_before_save(&mut profiles, live_hash.as_deref());
+    if removed.is_empty() {
+        return;
+    }
+    match save_index(&profiles) {
+        Ok(()) => eprintln!(
+            "[migrate] 已自动合并 {} 条重复账号档案（原数据备份于 account-backups/）",
+            removed.len()
+        ),
+        Err(e) => eprintln!("[migrate] 合并重复档案写盘失败: {e}"),
     }
 }
 
@@ -1086,13 +1266,22 @@ fn prepare_setting_route_update(family: &str, mode: &str) -> R<Option<(PathBuf, 
 #[tauri::command]
 pub fn list_profiles() -> R<Vec<ProfileView>> {
     let profiles = load_index();
-    let active_key = current_identity().and_then(|identity| identity.key());
+    let active_identity = current_identity();
     let views = profiles
         .into_iter()
         .map(|p| {
-            let active = active_key
+            let active = active_identity
                 .as_ref()
-                .map(|key| profile_identity_key(&p).as_deref() == Some(key.as_str()))
+                .map(|identity| {
+                    signals_overlap(
+                        &profile_identity_signals(&p),
+                        &identity_signals(
+                            &identity.email,
+                            &identity.phone,
+                            &identity.user_id,
+                        ),
+                    )
+                })
                 .unwrap_or(false);
             let short_id = short_id(&p.user_id);
             ProfileView {
@@ -1179,13 +1368,16 @@ pub fn capture_current(name: String) -> R<Profile> {
 
     let mut profiles = load_index();
 
-    // 邮箱优先、手机号其次、用户 ID 兜底；再次保存同账号时更新凭据副本而不是新增档案。
-    if let Some(p) = profiles
-        .iter_mut()
-        .find(|p| profile_identity_key(p).as_deref() == Some(key.as_str()))
-    {
+    // 身份信号（email/phone/user_id）任一重叠即视为同一账号：再次保存同账号时
+    // 更新凭据副本而不是新增档案（即使这次抓到了邮箱、旧档案只存了 user_id）。
+    if let Some(idx) = find_profile_index_by_signals(
+        &profiles,
+        &identity.email,
+        &identity.phone,
+        &user_id,
+    ) {
         let saved = update_profile_from_capture(
-            p,
+            &mut profiles[idx],
             final_name,
             user_id.clone(),
             identity.email.clone(),
@@ -1536,12 +1728,17 @@ pub fn rename_profile(id: String, name: String) -> R<bool> {
 pub fn delete_profile(id: String) -> R<bool> {
     let mut profiles = load_index();
 
-    // 不允许删除当前正在使用的账号
+    // 不允许删除当前正在使用的账号（按身份信号重叠判定，避免单键漏判误删）
     if let Some(identity) = current_identity() {
-        let current_key = identity.key();
         let is_active = profiles
             .iter()
-            .any(|p| p.id == id && current_key.as_deref() == profile_identity_key(p).as_deref());
+            .any(|p| {
+                p.id == id
+                    && signals_overlap(
+                        &profile_identity_signals(p),
+                        &identity_signals(&identity.email, &identity.phone, &identity.user_id),
+                    )
+            });
         if is_active {
             return Err(AppError::Msg("不能删除当前正在使用的账号".into()));
         }
@@ -1697,10 +1894,10 @@ fn import_portable_account(portable: PortableAccount) -> R<Profile> {
 
     let merged: Option<Profile> = {
         let mut merged_out = None;
-        if let Some(existing) = profiles
-            .iter_mut()
-            .find(|p| profile_identity_key(p).as_deref() == Some(key.as_str()))
+        if let Some(existing_idx) =
+            find_profile_index_by_signals(&profiles, &email, &phone, &user_id)
         {
+            let existing = &mut profiles[existing_idx];
             // 同身份档案已存在 → 就地合并而非拒绝导入：导入方是最新快照，
             // 凭据/family/mode/apiKey 快照整体覆盖；档案 id 和现有名字保留
             //（用户可能已重命名，且 id 是身份哈希，改名会破坏凭据文件对应关系）。
@@ -2162,6 +2359,168 @@ mod tests {
             Some("uid:bm-user-001")
         );
         assert_eq!(identity_key("  ", "", "  "), None);
+    }
+
+    /// 构造测试档案；cred_file 留空，避免去重时触碰真实文件系统。
+    fn test_profile(id: &str, email: &str, phone: &str, user_id: &str) -> Profile {
+        Profile {
+            id: id.into(),
+            name: format!("name-{id}"),
+            user_id: user_id.into(),
+            email: email.into(),
+            phone: phone.into(),
+            avatar: String::new(),
+            cred_hash: format!("hash-{id}"),
+            cred_file: String::new(),
+            created_at: 1.0,
+            updated_at: 1.0,
+            family: "bigmodel".into(),
+            mode: "oauth".into(),
+            provider_api_keys: Default::default(),
+        }
+    }
+
+    /// 真实发生过的漏判场景：同一账号一条只存 user_id、另一条存了邮箱
+    /// （identity_key 取值不同导致旧版去重漏判）。按信号重叠必须合并成一条，
+    /// 且保留"当前在用"的凭据，并把邮箱补进主档案。
+    #[test]
+    fn dedup_merges_uid_only_with_email_profile_sharing_uid() {
+        let mut a = test_profile("a", "", "", "46241774361510943");
+        a.cred_hash = "live-hash".into();
+        a.updated_at = 10.0;
+        let mut b = test_profile("b", "fe****er@163.com", "", "46241774361510943");
+        b.updated_at = 5.0;
+        let mut profiles = vec![a, b];
+
+        let removed = dedup_before_save(&mut profiles, Some("live-hash"));
+        assert_eq!(profiles.len(), 1, "同账号两条档案应合并为一条");
+        assert_eq!(removed.len(), 1);
+        let winner = &profiles[0];
+        assert_eq!(winner.id, "a", "在用凭据的档案应当选主");
+        assert_eq!(winner.cred_hash, "live-hash");
+        assert_eq!(winner.email, "fe****er@163.com", "主档案应补上邮箱");
+        assert_eq!(winner.user_id, "46241774361510943");
+        assert_eq!(removed[0].id, "b");
+    }
+
+    /// 传递重叠的链式合并：A(uid:u1) + B(uid:u1,email:x) + C(email:x) 同组。
+    #[test]
+    fn dedup_merges_transitive_signal_chains_into_one() {
+        let a = test_profile("a", "", "", "u1");
+        let mut b = test_profile("b", "x@example.com", "", "u1");
+        b.updated_at = 9.0;
+        let mut c = test_profile("c", "x@example.com", "", "");
+        c.updated_at = 2.0;
+        let mut profiles = vec![a, b, c];
+
+        let removed = dedup_before_save(&mut profiles, Some("hash-b"));
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(removed.len(), 2);
+        let winner = &profiles[0];
+        assert_eq!(winner.id, "b", "在用凭据的档案当选主");
+        assert_eq!(winner.user_id, "u1");
+        assert_eq!(winner.email, "x@example.com");
+    }
+
+    #[test]
+    fn dedup_keeps_distinct_accounts_untouched() {
+        let a = test_profile("a", "a@example.com", "", "u1");
+        let b = test_profile("b", "b@example.com", "", "u2");
+        let mut c = test_profile("c", "", "13800138000", "");
+        c.email = String::new();
+        let mut profiles = vec![a, b, c];
+        let removed = dedup_before_save(&mut profiles, None);
+        assert!(removed.is_empty());
+        assert_eq!(profiles.len(), 3);
+    }
+
+    /// 没有 live 凭据可比对时，updated_at 最新的当选主。
+    #[test]
+    fn dedup_prefers_newest_updated_at_without_live_match() {
+        let mut old = test_profile("old", "x@example.com", "", "u1");
+        old.updated_at = 1.0;
+        let mut new = test_profile("new", "", "", "u1");
+        new.updated_at = 99.0;
+        let mut profiles = vec![old, new];
+
+        let _ = dedup_before_save(&mut profiles, None);
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].id, "new", "最近使用的档案当选主");
+        assert_eq!(profiles[0].email, "x@example.com", "空缺邮箱应从被合并档案补齐");
+    }
+
+    /// apiKey 快照做并集：主档案已有键保留自己的值，缺失键从被合并档案补齐。
+    #[test]
+    fn dedup_merges_provider_api_keys_as_union() {
+        let mut winner = test_profile("w", "", "", "u1");
+        winner.provider_api_keys.insert(
+            "builtin:bigmodel-start-plan".into(),
+            "winner-jwt".into(),
+        );
+        let mut donor = test_profile("d", "x@example.com", "", "u1");
+        donor.provider_api_keys.insert(
+            "builtin:bigmodel-start-plan".into(),
+            "donor-jwt".into(),
+        );
+        donor
+            .provider_api_keys
+            .insert("builtin:zai".into(), "donor-zai".into());
+        let mut profiles = vec![winner, donor];
+
+        let _ = dedup_before_save(&mut profiles, Some("hash-w"));
+        assert_eq!(profiles.len(), 1);
+        let keys = &profiles[0].provider_api_keys;
+        assert_eq!(keys.len(), 2);
+        assert_eq!(
+            keys.get("builtin:bigmodel-start-plan").map(String::as_str),
+            Some("winner-jwt"),
+            "主档案已有的键不应被覆盖"
+        );
+        assert_eq!(keys.get("builtin:zai").map(String::as_str), Some("donor-zai"));
+        assert_eq!(profiles[0].email, "x@example.com");
+    }
+
+    #[test]
+    fn find_profile_index_by_signals_matches_any_overlap() {
+        let profiles = vec![
+            test_profile("a", "a@example.com", "", ""),
+            test_profile("b", "", "", "u2"),
+        ];
+        // 只有 user_id 的实时身份也能匹配到存了同一 user_id 的档案。
+        assert_eq!(
+            find_profile_index_by_signals(&profiles, "", "", "u2"),
+            Some(1)
+        );
+        // email 与 uid 都重叠时命中第一条。
+        assert_eq!(
+            find_profile_index_by_signals(&profiles, "A@Example.com ", "", ""),
+            Some(0),
+            "email 匹配应做归一化"
+        );
+        assert_eq!(
+            find_profile_index_by_signals(&profiles, "", "", "u9"),
+            None,
+            "无信号重叠不应误匹配"
+        );
+        assert_eq!(
+            find_profile_index_by_signals(&profiles, "", "", ""),
+            None,
+            "实时身份无任何字段时不应匹配"
+        );
+    }
+
+    #[test]
+    fn has_identity_duplicates_detects_only_overlapping_signals() {
+        let dup = vec![
+            test_profile("a", "", "", "u1"),
+            test_profile("b", "x@example.com", "", "u1"),
+        ];
+        assert!(has_identity_duplicates(&dup));
+        let distinct = vec![
+            test_profile("a", "a@example.com", "", "u1"),
+            test_profile("b", "b@example.com", "", "u2"),
+        ];
+        assert!(!has_identity_duplicates(&distinct));
     }
 
     #[test]

@@ -1,25 +1,37 @@
-# ZCode Switcher 1.1.14 Release
+# ZCode Switcher 1.1.15+43 Release
 
-发布于 2026-09-16。本地构建产物，对应 git commit `0633077`。
+发布于 2026-09-17。本地构建产物（`npm run tauri build`，build.count=43），
+已在构建机上完成真机部署验证。
 
 ## 产物
 
 | 文件 | 大小 | SHA-256 |
 |---|---|---|
-| `ZCodeSwitcher-1.1.14-x64-setup.exe` | 4.0 MB | `7fc0f0cd3b8cf260df636c5c72217a7483849f5532fefb31078309d5305c3939` |
-| `latest.json` | – | Tauri updater 清单 |
+| `ZCodeSwitcher-1.1.15+43-x64-setup.exe` | 4.0 MB | `d17e2c72e6998ed940ba63b6d83efabc8a151c9a67d17038578dcd873074647b` |
+| `latest.json` | – | Tauri updater 清单（本地构建无签名） |
 | `SHA256SUMS.txt` | – | 上述 sha256 |
 
-> Windows ARM64 (`aarch64-pc-windows-msvc`) 在本机工具链上未构建（无 cross
-> toolchain）；如需，参考 `.github/workflows/release.yml` 在
-> `windows-latest` 上用 `npm run tauri build -- --target
-> aarch64-pc-windows-msvc` 走 CI 路径。
+## 本版修复（摘自 `docs/changelog.md`）
 
-## 安装与使用
+- **托盘双图标修复**：tauri.conf.json 的声明式 `trayIcon` 与代码里的
+  `setup_tray` 重复创建托盘，移除配置项，只保留带「显示/退出」菜单的程序化托盘。
+- **重复账号自动合并**：同一账号"一条档案存了邮箱、另一条只有用户 ID"曾被
+  判定为两个账号（旧版按单一身份键去重漏判）。现改为身份信号（邮箱/手机号/
+  用户 ID 任一重叠）并查集分组，主档案吸收空缺字段与缺失的 apiKey 快照；
+  应用启动时自动迁移收敛一次，合并前自动备份到 `account-backups/`。
+- 保存/导入/切换/活跃判定全部改用身份信号重叠匹配，重新捕获同账号不再产生新档案。
+- **版本号引入编译次数**：显示为「版本+编译次数」（如 1.1.15+43），每次
+  `tauri build` 自动递增（`scripts/stamp-build.mjs` + `build.count`）；
+  `+N` 为 semver 构建元数据，不影响自动更新的版本比较。
+- 设置面板版本显示规范化为 `v1.1.15+43`。
 
-1. 双击 `ZCodeSwitcher-1.1.14-x64-setup.exe` → 默认装到
-   `%LOCALAPPDATA%\ZCode Switcher\`。
-2. 启动后登录 ZCode 账号；按 `ZCode Switcher` 文档配置。
+## 真机验证（2026-09-17，构建机）
+
+- 静默安装（NSIS `/S`）覆盖 1.1.14 成功，exe 元数据 `ProductVersion = 1.1.15+43`。
+- 设置面板「关于」显示 `版本 v1.1.15+43`。
+- 账号列表收敛为 2 条（重复的 pcwelcl0 卡片消失），在用会话凭据保持不变。
+- 单实例：再次启动 exe 不产生第二个进程，仅唤起已有窗口。
+- 托盘仅 1 个图标。
 
 ## 自测命令
 
@@ -30,31 +42,15 @@ zcode-switcher.exe --plan-switch-probe start-plan    # 套餐切换 + setting.js
 zcode-switcher.exe --plan-switch-probe coding-plan
 ```
 
-详细断言矩阵见 `docs/verification-1.1.14.md`。
-
-## 主要变化（摘自 `docs/changelog.md`）
-
-- 低额度自动切换改为"先切套餐、后切账号"：判定对象改为 ZCode 当前选中的套餐入口，当前入口余额不足时先切换到同账号内仍有余额的另一个套餐入口（Start Plan 入口 ↔ GLM Coding Plan 入口），账号内所有套餐都低于阈值后才切换账号。
-- 新增"低额度时动作"设置：除自动切换外，可选择"暂停执行"——余额低于阈值时本地网关拦截所有模型请求（非流式 429 / 流式 SSE error），同时停止自动切换并提醒，**等待人工操作才解除**。
-- 实测 ZCode 不监听 setting.json 外部修改：套餐切换优先通过 CDP 注入渲染层 settingService 实时生效（无需重启），不可用时退回写配置文件并在开启自动重启时自动重启 ZCode。
-- 新增真机自测命令：`--guard-selftest`（网关拦截链路）、`--plan-switch-probe`（套餐切换落盘验证）。
-- 审计修正：暂停模式不再污染全局 `autoSwitchPaused` 标志（该标志语义是"所有账号 Token/积分均低于阈值"）；`isCurrentEntryLow` 在当前入口无数据时回退到整账号判定，避免账号只订阅单套餐时自动切换失灵；不再以可能过期的 Coding Plan API Key 本地快照阻断套餐切换。
-
 ## 已知问题 / 注意事项
 
-- **本地 tauri build 失败**：当前 `zcode-switcher.exe` 进程（PID 103732）占着
-  `src-tauri/target/release/zcode-switcher.exe`，cargo 无法覆盖。本 release
-  采用的是上一轮（17:50 前后）已经成功构建的产物，对应 `0633077`。
-- **签名**：`latest.json` 的 `signature` 字段为空——本地无 `TAURI_SIGNING_PRIVATE_KEY`。
-  CI release.yml 用 tauri-action 自动签；本目录产物**未签名**，仅供本地
-  验证；分发给真实用户走 GitHub Release 上带签名的 `latest.json`。
-- **Windows GNU 工具链**：仍受 `w64devkit` 缺 `libgcc_eh` 影响，
-  `cargo test --lib` 必须切 MSVC（`cargo +stable-x86_64-pc-windows-msvc
-  test --lib`）。见 `docs/environment.md` §7。
+- **签名**：`latest.json` 的 `signature` 字段为空——本地无
+  `TAURI_SIGNING_PRIVATE_KEY`。CI release.yml 用 tauri-action 自动签；
+  本目录产物**未签名**，仅供本地验证；分发给真实用户走 GitHub Release 上
+  带签名的 `latest.json`（推送 `v1.1.15` tag 触发）。
+- Windows ARM64 仍需走 CI 路径构建（参考 `.github/workflows/release.yml`）。
 
 ## 关联文档
 
 - `docs/environment.md` — 跨平台环境搭建与构建手册
-- `docs/macos.md` — macOS 专属（签名 / 公证 / DMG）
-- `docs/verification-1.1.14.md` — 1.1.14 真机验收清单
-- `INSTALL.md` — 1.1.12 时期的 Windows 安装实录（保留作历史）
+- `docs/changelog.md` — 完整更新日志

@@ -667,6 +667,9 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
             captcha::init(app.handle().clone());
+            // 启动时把历史版本漏判产生的重复账号档案自动合并一次
+            //（旧版按单一身份键去重，"一行存邮箱、一行只有 user_id"会漏判）。
+            profile::migrate_merge_duplicates();
             let handle = app.handle().clone();
             handle.deep_link().on_open_url(move |event| {
                 for url in event.urls() {

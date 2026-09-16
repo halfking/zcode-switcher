@@ -13,7 +13,7 @@
     "本文件作为 CI 默认配置存在；要差异化打包请另起 *.conf.json。"
   ],
   "productName": "ZCode Switcher",
-  "version": "1.1.14",
+  "version": "1.1.15+43",
   "identifier": "com.zcode.switcher",
   "build": {
     "beforeDevCommand": "npm run dev",
