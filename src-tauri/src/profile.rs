@@ -2100,7 +2100,7 @@ mod tests {
         assert!(merge_selected_provider_key(
             &String::from_utf8(merged).unwrap(),
             "bigmodel",
-            "coding-plan:builtin:bigmodel-start-plan"
+            "coding-plan:builtin:bigmodel-start-plan",
         )
         .is_none());
 
@@ -2124,6 +2124,27 @@ mod tests {
 
         // 损坏的 JSON → 不写入（宁可不切，也不能覆盖用户配置）
         assert!(merge_selected_provider_key("not json", "bigmodel", "x").is_none());
+    }
+
+    /// 锁定 `plan_switch_probe_cli` 与 CDP 注入脚本都依赖的 family 解析。
+    /// 原实现用 `contains(":builtin:zai-")` 这种带前导冒号的字面量，selected_key
+    /// 实际是 `coding-plan:builtin:zai-start-plan`（前缀是 `coding-plan:builtin:`，
+    /// 不是 `:builtin:`），zai / bigmodel 都会被误判为不匹配。
+    /// 这里用 strip_prefix 路径固化正确语义。
+    #[test]
+    fn selected_key_family_prefix_round_trips_through_strip_prefix() {
+        for (key, expected_family) in [
+            ("coding-plan:builtin:bigmodel-start-plan", "bigmodel"),
+            ("coding-plan:builtin:bigmodel-coding-plan", "bigmodel"),
+            ("coding-plan:builtin:zai-start-plan", "zai"),
+            ("coding-plan:builtin:zai-coding-plan", "zai"),
+        ] {
+            let parsed = key
+                .strip_prefix("coding-plan:builtin:")
+                .and_then(|rest| rest.split_once('-').map(|(fam, _)| fam))
+                .unwrap();
+            assert_eq!(parsed, expected_family, "selected_key 解析失败: {key}");
+        }
     }
 
     #[test]

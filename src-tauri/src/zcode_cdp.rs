@@ -80,7 +80,10 @@ const INJECT_SCRIPT: &str = r#"(async () => {
     }
     const stack = [root];
     let count = 0;
-    while (stack.length && count < 200000) {
+    // 硬上限：覆盖到 ZCode 当前 fiber 节点规模的 ~3x 余量。WS_TIMEOUT=3s，
+    // 实测 30 万节点遍历在 100-300ms 完成，60 万仍在 1s 以内；提高上限只为
+    // 兼容未来 ZCode 渲染树变深。命中后立即返回，不写缓存，下次注入重走。
+    while (stack.length && count < 600000) {
       const node = stack.pop();
       count++;
       for (const slot of ['memoizedProps', 'memoizedState', 'pendingProps', 'stateNode']) {

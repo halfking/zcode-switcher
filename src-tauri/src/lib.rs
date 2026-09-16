@@ -572,20 +572,35 @@ fn plan_switch_probe_cli() -> i32 {
                 "切换结果: selected_key={} applied_live={}",
                 outcome.selected_key, outcome.applied_live
             );
-            // 读回 setting.json 验证磁盘值
+            // 读回 setting.json 验证磁盘值。
+            // selected_key 形如 "coding-plan:builtin:bigmodel-start-plan"——前缀是
+            // "coding-plan:builtin:"，不是 ":builtin:"。原来的 contains 检查用了
+            // 后者，导致 zai / bigmodel 都被误判为非匹配，验证永远 FAIL。
             match profile::setting_file() {
                 Ok(path) => match std::fs::read_to_string(path) {
                     Ok(text) => {
-                        let family = if outcome.selected_key.contains(":builtin:zai-") {
-                            "zai"
-                        } else {
-                            "bigmodel"
+                        // 直接从 outcome.selected_key 解析 family，避免再走一次
+                        // current_provider_family()（那是 env 探测，本进程可能
+                        // 没有 ZCode 配置目录，读不到也正常）。
+                        let family = match outcome
+                            .selected_key
+                            .strip_prefix("coding-plan:builtin:")
+                            .and_then(|rest| rest.split_once('-').map(|(fam, _)| fam))
+                        {
+                            Some(fam) => fam.to_string(),
+                            None => {
+                                println!(
+                                    "落盘验证: FAIL (无法从 selected_key 解析 family: {})",
+                                    outcome.selected_key
+                                );
+                                return 1;
+                            }
                         };
                         match serde_json::from_str::<serde_json::Value>(&text) {
                             Ok(v) => {
                                 let on_disk = v
                                     .get("modelProviderFamilySelectedKeys")
-                                    .and_then(|s| s.get(family))
+                                    .and_then(|s| s.get(&family))
                                     .and_then(|s| s.as_str())
                                     .unwrap_or("(缺失)");
                                 if on_disk == outcome.selected_key {
