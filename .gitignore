@@ -19,6 +19,13 @@ refresh-desktop-icon-cache.bat
 *.msi
 *.zip
 *.local
+# 发布产物：仅 release/ 目录例外推上去（必须放在 *.exe / *.msi / *.zip
+# 之**后**，最后匹配的规则生效）。具体白名单而非仅目录，避免泄漏其它位置
+# 的临时 exe。
+!release/
+!release/ZCodeSwitcher-*.exe
+!release/*.msi
+!release/*.zip
 
 # Editor directories and files
 .vscode/*
