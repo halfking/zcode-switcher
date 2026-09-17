@@ -17,6 +17,8 @@ import {
 } from "./lib/glm52";
 import {
   currentPlanEntry,
+  DEFAULT_VERIFY_CONCURRENCY,
+  DEFAULT_VERIFY_TIMEOUT_MS,
   firstVerifiedTarget,
   isCurrentEntryLow,
   pickPlanSwitchTarget,
@@ -71,6 +73,17 @@ interface ToastMsg {
   kind: ToastKind;
 }
 
+/**
+ * 低额度切换"切账号"阶段的候选验证进度（UI 展示；会话内状态）。
+ * `active` 为正在验证中的账号名（并发上限内的在飞候选）。
+ */
+export interface SwitchVerifyProgress {
+  total: number;
+  done: number;
+  failed: number;
+  active: string[];
+}
+
 interface AppState {
   profiles: ProfileView[];
   /** 账号 id → 额度信息 */
@@ -100,6 +113,16 @@ interface AppState {
    * 重新开启开关时自动解除。
    */
   autoSwitchPaused: boolean;
+  /**
+   * 切账号阶段的候选余额验证进度；null = 不在验证中（会话内状态，不持久化）。
+   */
+  switchVerifyProgress: SwitchVerifyProgress | null;
+  /**
+   * 候选余额验证的并发上限与单候选超时（非用户配置、不持久化）：
+   * 生产默认 3 并发 / 15 秒；回归脚本按场景收紧以便注入挂死/慢速候选。
+   */
+  candidateVerifyConcurrency: number;
+  candidateVerifyTimeoutMs: number;
   autoRestart: boolean;
   tryNoRestartSwitch: boolean;
   theme: Theme;
@@ -143,6 +166,7 @@ interface AppState {
   setGlm52AutoSwitchPointThreshold: (v: number) => void;
   setGlm52LowQuotaAction: (v: LowQuotaAction) => void;
   setAutoSwitchPaused: (v: boolean) => void;
+  setSwitchVerifyProgress: (p: SwitchVerifyProgress | null) => void;
   setAutoRestart: (v: boolean) => void;
   setTryNoRestartSwitch: (v: boolean) => void;
   setTheme: (v: Theme) => void;
@@ -628,9 +652,9 @@ async function maybeSwitchGlm52Account(getStore: () => AppState) {
   }
 
   // 第 2 步：帐号内所有套餐都低于阈值 → 切换帐号。候选先用缓存余量排出
-  // 验证顺序，然后逐一重新拉取最新余额复核：其已知 token/积分量纲必须
-  // 全部高于阈值（缓存可能过期，凭旧数据切换会从一个耗尽的帐户切到
-  // 另一个耗尽的帐户）；只切到第一个验证通过的帐号。
+  // 优先级顺序，然后用最新余额复核（限并发、单候选限时）：其已知 token/积分
+  // 量纲必须全部高于阈值（缓存可能过期，凭旧数据切换会从一个耗尽的帐户切到
+  // 另一个耗尽的帐户）；只切到验证通过的候选中优先级最高的帐号。
   const orderedCandidates = state.profiles
     .filter((p) => p.id !== active.id)
     .map((profile) => ({ profile, quota: state.quotas[profile.id] }))
@@ -655,8 +679,16 @@ async function maybeSwitchGlm52Account(getStore: () => AppState) {
 
   glm52AutoSwitching = true;
   try {
-    // 逐一验证：每个候选切之前都重新拉取最新余额复核，拉取失败或复核
-    // 不合格的候选直接跳过（绝不盲切），第一个通过验证的才成为目标。
+    // 验证候选：每个候选切之前都重新拉取最新余额复核，拉取失败/超时或复核
+    // 不合格的候选直接跳过（绝不盲切），余额充足里优先级最高的才成为目标。
+    // 并发上限与单候选超时兜底验证链路：上游挂起时最多等 timeoutMs，
+    // 多候选并行验证缩短整体决策时间；进度实时回报给 UI。
+    getStore().setSwitchVerifyProgress({
+      total: orderedCandidates.length,
+      done: 0,
+      failed: 0,
+      active: [],
+    });
     const verified = await firstVerifiedTarget(
       orderedCandidates,
       async (item) => {
@@ -664,8 +696,23 @@ async function maybeSwitchGlm52Account(getStore: () => AppState) {
         return getStore().quotas[item.profile.id];
       },
       (_item, fresh) =>
-        isSwitchableCandidate(fresh ?? undefined, tokenWan, pointThreshold)
+        isSwitchableCandidate(fresh ?? undefined, tokenWan, pointThreshold),
+      {
+        concurrency: getStore().candidateVerifyConcurrency,
+        timeoutMs: getStore().candidateVerifyTimeoutMs,
+        onProgress: (progress) => {
+          getStore().setSwitchVerifyProgress({
+            total: progress.total,
+            done: progress.done,
+            failed: progress.failed,
+            active: progress.activeIndexes
+              .map((i) => orderedCandidates[i]?.profile.name)
+              .filter((name): name is string => !!name),
+          });
+        },
+      }
     );
+    getStore().setSwitchVerifyProgress(null);
 
     if (!verified) {
       // 逐一验证后没有任何帐号余额达标：宁可暂停也绝不切换。
@@ -687,6 +734,8 @@ async function maybeSwitchGlm52Account(getStore: () => AppState) {
     await state.switchTo(verified.profile.id);
   } finally {
     glm52AutoSwitching = false;
+    // 验证中途抛错也不能把进度条残留到下一轮。
+    getStore().setSwitchVerifyProgress(null);
   }
 }
 
@@ -728,6 +777,9 @@ export const useStore = create<AppState>((set, get) => {
     glm52AutoSwitchPointThreshold: loadGlm52AutoSwitchPointThreshold(),
     glm52LowQuotaAction: loadGlm52LowQuotaAction(),
     autoSwitchPaused: false,
+    switchVerifyProgress: null,
+    candidateVerifyConcurrency: DEFAULT_VERIFY_CONCURRENCY,
+    candidateVerifyTimeoutMs: DEFAULT_VERIFY_TIMEOUT_MS,
     autoRestart: initialAutoRestart,
     tryNoRestartSwitch: initialTryNoRestartSwitch,
     theme: initialTheme,
@@ -1136,6 +1188,10 @@ export const useStore = create<AppState>((set, get) => {
   setAutoSwitchPaused: (v) => {
     if (get().autoSwitchPaused === v) return;
     set({ autoSwitchPaused: v });
+  },
+
+  setSwitchVerifyProgress: (p) => {
+    set({ switchVerifyProgress: p });
   },
 
   setAutoRestart: (v) => {

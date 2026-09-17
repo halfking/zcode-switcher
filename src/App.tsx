@@ -96,6 +96,7 @@ export default function App() {
     glm52AutoSwitchEnabled,
     glm52AutoSwitchThresholdWan,
     glm52AutoSwitchPointThreshold,
+    switchVerifyProgress,
     floatingWindowMode,
     floatingWindowScale,
     theme,
@@ -732,6 +733,24 @@ export default function App() {
         <div className="mx-7 mt-4 flex items-start gap-2 rounded-lg border border-warn/35 bg-warn/10 px-3 py-2 text-xs font-medium text-warn">
           <AlertTriangle size={14} className="mt-0.5 shrink-0" />
           <span>{startupIssueText}</span>
+        </div>
+      )}
+
+      {/* 低额度自动切换切账号阶段的候选余额验证进度 */}
+      {switchVerifyProgress && (
+        <div
+          role="status"
+          className="mx-7 mt-4 flex items-center gap-2 rounded-lg border border-accent/35 bg-accent/10 px-3 py-2 text-xs font-medium text-accent"
+        >
+          <RefreshCw size={14} className="shrink-0 animate-spin" />
+          <span className="break-all">
+            {formatText(t.glmVerifyProgress, {
+              done: switchVerifyProgress.done,
+              total: switchVerifyProgress.total,
+              names:
+                switchVerifyProgress.active.join("、") || t.glmVerifyPending,
+            })}
+          </span>
         </div>
       )}
 

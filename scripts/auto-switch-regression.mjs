@@ -1,12 +1,17 @@
-// store 级集成回归：低额度自动切换的目标余额逐一验证布线。
+// store 级集成回归：低额度自动切换的目标余额验证布线。
 //
-// 覆盖（对应 docs/fixes-2026-09-17-balance-verify.md 审计结论）：
+// 覆盖（对应 docs/fixes-2026-09-17-balance-verify.md 审计结论 + 并发/超时迭代）：
 //   S1   候选按余量排序后逐一用最新拉取的余额复核：缓存充足但复核耗尽的
 //        候选被跳过，切到第一个验证通过的账号（绝不凭过期缓存切换）。
 //   S2   所有候选复核不合格 → 不执行任何切换，进入自动暂停。
 //   S3S4 复核发现当前入口余额已恢复 → 什么都不做；且复核轮次不消耗套餐
 //        切换冷却，紧接着的下一轮能正常执行真正的切套餐（冷却回归防护）。
 //   S5   切套餐失败（入口缺 API Key 等）→ 视同耗尽，落入切账号逐一验证。
+//   S6   并发上限：候选验证按 candidateVerifyConcurrency 并行（在飞数
+//        ≤上限且 >1），优先级语义不变——切到的仍是"有余额的最高优先级
+//        候选"；验证进度经 switchVerifyProgress 实时暴露并在结束后清空。
+//   S7   单候选超时：复核请求挂死的候选在 candidateVerifyTimeoutMs 后按
+//        不合格跳过，切换落 to 后续合格候选，整体流程不被挂死拖住。
 //
 // store 模块内有跨调用的冷却/守护状态，每个场景在独立子进程中运行，
 // 保证互不污染。失败时 exit 1（并保留临时 bundle 目录供排查）。
@@ -31,11 +36,31 @@ const coreStub = `
       const id = args && args.id;
       const counts = (globalThis.__fetchCounts ||= {});
       counts[id] = (counts[id] ?? 0) + 1;
+      // 在飞计数：给 S6 断言"确实并发且不超过上限"用。
+      const inflight = (globalThis.__inflight ||= { n: 0, max: 0 });
+      inflight.n += 1;
+      inflight.max = Math.max(inflight.max, inflight.n);
       const script = (globalThis.__quotaScripts || {})[id];
-      if (!script) {
-        return { plan_name: null, plan_description: null, plan_status: null, plan_ends_at: null, balances: [] };
-      }
-      return script(counts[id]);
+      const empty = { plan_name: null, plan_description: null, plan_status: null, plan_ends_at: null, balances: [] };
+      // __fetchDelayMs：人为拉长每次拉取，制造可观测的并发窗口（默认 0）。
+      const delayMs = globalThis.__fetchDelayMs || 0;
+      const run = script
+        ? Promise.resolve(script(counts[id]))
+        : Promise.resolve(empty);
+      return new Promise((resolve, reject) => {
+        run.then(
+          (value) =>
+            setTimeout(() => {
+              inflight.n -= 1;
+              resolve(value);
+            }, delayMs),
+          (error) =>
+            setTimeout(() => {
+              inflight.n -= 1;
+              reject(error);
+            }, delayMs)
+        );
+      });
     }
     if (command === "switch_to") {
       (globalThis.__switches ||= []).push(args);
@@ -164,6 +189,73 @@ const scenarios: Record<string, () => Promise<void>> = {
     const sw = calls("switch_to");
     assert(sw.length === 1 && sw[0].args.id === "B", "切套餐失败应逐一验证并切到 B");
   },
+
+  async S6() {
+    // 并发上限 + 进度暴露：4 个缓存都充足的候选按余量排序 B>C>D>E，
+    // 复核时 B、C 已耗尽（跳过），D、E 合格 → 胜者必须是优先级更高的 D
+    // （并发不改变"有余额的最高优先级候选"语义）。
+    (globalThis as any).__fetchDelayMs = 25;
+    useStore.setState({ candidateVerifyConcurrency: 3 });
+    const progressSeen: any[] = [];
+    const unsub = useStore.subscribe((s: any) => {
+      if (s.switchVerifyProgress) {
+        progressSeen.push({
+          total: s.switchVerifyProgress.total,
+          done: s.switchVerifyProgress.done,
+          failed: s.switchVerifyProgress.failed,
+          active: [...s.switchVerifyProgress.active],
+        });
+      }
+    });
+    try {
+      await arm(["A", "B", "C", "D", "E"], "A", {
+        A: () => ({ balances: [tok(0)] }),
+        B: (n: number) => ({ balances: [tok(n === 1 ? 900 : 0)] }),
+        C: (n: number) => ({ balances: [tok(n === 1 ? 800 : 0)] }),
+        D: () => ({ balances: [tok(700)] }),
+        E: () => ({ balances: [tok(600)] }),
+      });
+      await cycle();
+    } finally {
+      unsub();
+      (globalThis as any).__fetchDelayMs = 0;
+    }
+    const sw = calls("switch_to");
+    assert(sw.length === 1 && sw[0].args.id === "D",
+      "并发验证下应切到有余额的最高优先级候选 D，实际 " + JSON.stringify(sw));
+    const inflight = (globalThis as any).__inflight || { max: 0 };
+    assert(inflight.max === 3,
+      "在飞验证数应恰为并发上限 3（批量刷新是串行的），实际 max=" + inflight.max);
+    assert(progressSeen.length > 0, "验证期间应通过 switchVerifyProgress 暴露进度");
+    assert(progressSeen.some((p) => p.active.length === 3),
+      "应能观察到 3 个候选同时验证中，进度快照 " + JSON.stringify(progressSeen));
+    const last = progressSeen[progressSeen.length - 1];
+    assert(last.total === 4, "进度 total 应等于候选数 4，实际 " + JSON.stringify(last));
+    assert(last.done === 3 && last.failed === 2,
+      "B/C 复核耗尽 + D 通过后即决出胜者：done=3 failed=2，实际 " + JSON.stringify(last));
+    assert(state().switchVerifyProgress === null, "验证结束后进度应清空");
+  },
+
+  async S7() {
+    // 单候选超时：B 复核请求挂死 → candidateVerifyTimeoutMs 后按不合格跳过，
+    // 切到后续合格的 C，整个流程不被挂死拖住。
+    (globalThis as any).__fetchDelayMs = 0;
+    await arm(["A", "B", "C"], "A", {
+      A: () => ({ balances: [tok(0)] }),
+      // 第 1 次调用是批量刷新（返回充足缓存），第 2 次是验证：永远不返回。
+      B: (n: number) => (n === 1 ? { balances: [tok(900)] } : new Promise(() => {})),
+      C: () => ({ balances: [tok(800)] }),
+    });
+    useStore.setState({ candidateVerifyTimeoutMs: 400 });
+    const timeoutGuard = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("单候选超时未生效：验证被挂死的候选拖住")), 8000)
+    );
+    await Promise.race([cycle(), timeoutGuard]);
+    const sw = calls("switch_to");
+    assert(sw.length === 1 && sw[0].args.id === "C",
+      "挂死候选应被超时跳过并切到 C，实际 " + JSON.stringify(sw));
+    assert(state().autoSwitchPaused === false, "切到合格候选后不应进入自动暂停");
+  },
 };
 
 export async function runScenario(name: string) {
@@ -212,7 +304,7 @@ await build({
 });
 
 let failed = 0;
-for (const name of ["S1", "S2", "S3S4", "S5"]) {
+for (const name of ["S1", "S2", "S3S4", "S5", "S6", "S7"]) {
   const r = spawnSync(process.execPath, [bundle, name], { encoding: "utf8" });
   if (r.status !== 0) {
     failed += 1;

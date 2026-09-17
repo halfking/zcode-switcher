@@ -122,32 +122,144 @@ export function pickPlanSwitchTarget(
   return health.evaluable && !health.low ? other : null;
 }
 
+/** 单候选验证的默认超时（毫秒）：验证要拉一次真实余额，网络挂起时兜底。 */
+export const DEFAULT_VERIFY_TIMEOUT_MS = 15_000;
+/** 默认并发上限：余额请求打太快会撞上游限流，3 是延迟与限流之间的折中。 */
+export const DEFAULT_VERIFY_CONCURRENCY = 3;
+
+/** 候选验证进度（随验证推进回报给 UI）。 */
+export interface VerifyProgress {
+  /** 已出结果的候选数（合格 + 不合格） */
+  done: number;
+  total: number;
+  /** 已判定不合格的候选数（余额不足 / 拉取失败 / 超时） */
+  failed: number;
+  /** 仍在验证中的候选在 `ordered` 里的下标 */
+  activeIndexes: number[];
+}
+
+export interface VerifyOptions {
+  /** 同时验证的候选数上限，最小 1；默认 DEFAULT_VERIFY_CONCURRENCY */
+  concurrency?: number;
+  /** 单候选验证超时毫秒数，<=0 表示不限时；默认 DEFAULT_VERIFY_TIMEOUT_MS */
+  timeoutMs?: number;
+  /** 每次有候选开始/出结果时回调一次 */
+  onProgress?: (progress: VerifyProgress) => void;
+}
+
+function withTimeout<F>(promise: Promise<F>, timeoutMs: number): Promise<F> {
+  return new Promise<F>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`verify timeout (${timeoutMs}ms)`)),
+      timeoutMs
+    );
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
+}
+
 /**
- * 逐一验证候选目标：按给定顺序用最新拉取的余额逐个复核，返回第一个
- * 通过验证的目标；全部不通过（或余额拉取失败）返回 null —— 调用方
- * 必须放弃切换。用于低额度切换前确认"待切换的套餐/帐户确实有余额"，
- * 避免依据过期缓存把请求切到已耗尽的套餐/帐户上。
+ * 验证候选目标：用最新拉取的余额复核，返回通过验证的目标中优先级最高
+ * （在 `ordered` 里下标最小）的一个；全部不通过（或余额拉取失败/超时）
+ * 返回 null —— 调用方必须放弃切换。用于低额度切换前确认"待切换的
+ * 套餐/帐户确实有余额"，避免依据过期缓存把请求切到已耗尽的套餐/帐户上。
  *
- * - `ordered`：候选及验证顺序（调用方先按余量等排序）；
- * - `refresh`：拉取该目标的最新余额（抛错视为该目标不可验证 → 不合格）；
- * - `passes`：用最新余额判定该目标是否可切。
- * 每个候选都会调用 refresh（哪怕前面的失败了），直到某个通过为止。
+ * - `ordered`：候选及优先级顺序（调用方先按余量等排序）；
+ * - `refresh`：拉取该目标的最新余额（抛错或超时视为该目标不可验证 → 不合格）；
+ * - `passes`：用最新余额判定该目标是否可切；
+ * - `options.concurrency`：同时在飞的验证数上限；`options.timeoutMs`：单候选
+ *   超时；`options.onProgress`：进度回调。
+ *
+ * 并发不改变选择语义：排在前面的候选未出结果时，即使后面的候选先通过
+ * 也要等前面的判定完（前通过则前胜出），所以胜者永远是"有余额的最高
+ * 优先级候选"。确定胜者后剩余在飞的验证不再回报进度，其结果被忽略。
  */
 export async function firstVerifiedTarget<T, F>(
   ordered: readonly T[],
   refresh: (item: T) => Promise<F>,
-  passes: (item: T, fresh: F | null) => boolean
+  passes: (item: T, fresh: F | null) => boolean,
+  options: VerifyOptions = {}
 ): Promise<T | null> {
-  for (const item of ordered) {
-    let fresh: F | null = null;
-    try {
-      fresh = await refresh(item);
-    } catch {
-      fresh = null;
+  const total = ordered.length;
+  if (total === 0) return null;
+  const concurrency = Math.max(
+    1,
+    Math.min(options.concurrency ?? DEFAULT_VERIFY_CONCURRENCY, total)
+  );
+  const timeoutMs = options.timeoutMs ?? DEFAULT_VERIFY_TIMEOUT_MS;
+  const onProgress = options.onProgress;
+
+  // resolved[i] / results[i]：候选 i 是否已出结果及其最新余额（null=拉取失败/超时）
+  const resolved: boolean[] = new Array(total).fill(false);
+  const results: (F | null)[] = new Array(total).fill(null);
+  const active = new Set<number>();
+  let next = 0;
+  let done = 0;
+  let failed = 0;
+  let settled = false;
+
+  const emit = () =>
+    onProgress?.({
+      done,
+      total,
+      failed,
+      activeIndexes: [...active].sort((a, b) => a - b),
+    });
+
+  /** 胜者 = 下标最小且已通过验证的候选；前面还有在飞的就必须等它判定。 */
+  const settleIfDecided = (resolve: (winner: T | null) => void) => {
+    for (let i = 0; i < total; i += 1) {
+      if (!resolved[i]) return;
+      if (passes(ordered[i], results[i])) {
+        settled = true;
+        resolve(ordered[i]);
+        return;
+      }
     }
-    if (passes(item, fresh)) return item;
-  }
-  return null;
+    settled = true;
+    resolve(null);
+  };
+
+  return new Promise<T | null>((resolve) => {
+    const verifyOne = async (index: number) => {
+      let fresh: F | null = null;
+      try {
+        const pending = refresh(ordered[index]);
+        fresh = timeoutMs > 0 ? await withTimeout(pending, timeoutMs) : await pending;
+      } catch {
+        fresh = null;
+      }
+      results[index] = fresh;
+      resolved[index] = true;
+      active.delete(index);
+      done += 1;
+      if (!passes(ordered[index], fresh)) failed += 1;
+      if (settled) return; // 胜者已定：不再回报进度，结果作废
+      emit();
+      settleIfDecided(resolve);
+      if (!settled) launch();
+    };
+
+    const launch = () => {
+      while (!settled && next < total && active.size < concurrency) {
+        const index = next;
+        next += 1;
+        active.add(index);
+        emit();
+        void verifyOne(index);
+      }
+    };
+
+    launch();
+  });
 }
 
 /** 供展示/日志用：把入口映射为稳定标识（文案由 i18n 负责）。 */

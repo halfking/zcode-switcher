@@ -1,1 +1,1 @@
-34a65f11a4b45893f927ccb4040e598a1bf40da2bfeb1e4b7f6e6b6e6e369e5a *ZCodeSwitcher-1.1.16+46-x64-setup.exe
+d4a5f7fc5fdf93cc2f89d1564134df47549289cbab7b70e33e711afa30059e61 *ZCodeSwitcher-1.1.17+47-x64-setup.exe

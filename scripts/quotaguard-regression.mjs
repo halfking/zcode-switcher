@@ -207,8 +207,8 @@ function candidateOk(quota) {
 }
 
 {
-  // 场景 A：首个候选最新余额仍充足 → 直接选中，且不再刷新后面的候选
-  // （通过即停，不做多余的余额请求）。
+  // 场景 A：首个候选最新余额仍充足 → 直接选中。串行模式（concurrency=1）下
+  // 还要求"通过即停"：不再发起后面的余额请求。并发模式下的停止语义由场景 E 锁定。
   const refreshed = [];
   const candidates = [{ id: "A" }, { id: "B" }];
   const picked = await firstVerifiedTarget(
@@ -217,7 +217,8 @@ function candidateOk(quota) {
       refreshed.push(item.id);
       return { id: item.id, token: 800_000, point: 5_000 }; // 都高于阈值
     },
-    (_item, fresh) => candidateOk(fresh)
+    (_item, fresh) => candidateOk(fresh),
+    { concurrency: 1 }
   );
   assert.equal(picked?.id, "A", "首个候选通过时应被选中");
   assert.deepEqual(refreshed, ["A"], "通过即停：不应继续刷新后续候选");
@@ -282,6 +283,56 @@ function candidateOk(quota) {
   assert.equal(picked?.id, "B", "拉取失败的候选应被视为不合格并跳过");
   assert.deepEqual(refreshed, ["A", "B"], "抛错后应继续验证下一个候选");
   console.log("[9] 逐一验证：拉取失败视为不可验证 PASS");
+}
+
+{
+  // 场景 E：并发模式不改变选择语义 —— 低优先级候选先通过时，必须等更高
+  // 优先级的候选判定完：高优先级也通过 → 高优先级胜出。同时锁定：
+  //   - 并发上限（同时在飞的 refresh ≤ concurrency）；
+  //   - 单候选超时（挂死的候选按不合格跳过）；
+  //   - onProgress 进度回报（done/failed/activeIndexes）与胜者确定后停止回报。
+  const progress = [];
+  let inflight = 0;
+  let maxInflight = 0;
+  const candidates = [{ id: "A" }, { id: "B" }, { id: "C" }];
+  const picked = await firstVerifiedTarget(
+    candidates,
+    async (item) => {
+      inflight += 1;
+      maxInflight = Math.max(maxInflight, inflight);
+      try {
+        if (item.id === "A") {
+          // 高优先级但验证慢：B 先完成也不能抢跑。
+          await new Promise((resolve) => setTimeout(resolve, 120));
+          return { id: item.id, token: 700_000, point: 3_000 };
+        }
+        if (item.id === "B") {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          return { id: item.id, token: 900_000, point: 2_000 };
+        }
+        // C：挂死，只能靠超时判出局。
+        await new Promise(() => {});
+        return { id: item.id };
+      } finally {
+        inflight -= 1;
+      }
+    },
+    (_item, fresh) => candidateOk(fresh),
+    { concurrency: 2, timeoutMs: 250, onProgress: (p) => progress.push({ ...p, active: [...p.activeIndexes] }) }
+  );
+  assert.equal(picked?.id, "A", "并发下胜者仍应是优先级最高且合格的 A");
+  assert.equal(maxInflight, 2, "在飞验证数不得超过并发上限 2");
+  assert.ok(progress.length > 0, "应回报验证进度");
+  assert.ok(
+    progress.every((p) => p.active.length <= 2),
+    "进度里的在飞候选数不得超过并发上限"
+  );
+  assert.equal(progress[0].total, 3, "进度 total 应等于候选数");
+  // 胜者确定后不再回报进度：最后的进度事件必须早于（或等于）A 出结果，
+  // 且 done 不会把胜者确定后仍在飞的候选算进去。
+  const last = progress[progress.length - 1];
+  assert.ok(last.done >= 2, "胜者确定前 A、B 应已出结果");
+  console.log("[10] 并发验证：优先级语义 / 并发上限 / 超时 / 进度 PASS");
 }
 
 // ---- 清理 ------------------------------------------------------------------

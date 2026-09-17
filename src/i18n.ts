@@ -162,6 +162,8 @@ const zh = {
   glmPointThresholdDesc: "各积分桶（5 小时/每周/每月）剩余低于该值时触发切换",
   pointUnit: "积分",
   glmAutoSwitchPaused: "所有账号的 Token/积分均低于阈值，已自动暂停切换；额度恢复后自动继续",
+  glmVerifyProgress: "正在验证候选账号余额（{done}/{total}）：{names}",
+  glmVerifyPending: "等待验证结果…",
   glmLowQuotaActionTitle: "低额度时动作",
   glmLowQuotaActionSwitch: "自动切换套餐/账号",
   glmLowQuotaActionDescSwitch: "账号内先切换到有余额的套餐；所有套餐都低于阈值后才切换账号。",
@@ -494,6 +496,8 @@ const en: Texts = {
   glmPointThresholdDesc: "Switch when any points bucket (5h/weekly/monthly) falls below this value",
   pointUnit: "points",
   glmAutoSwitchPaused: "All accounts are below the token/points thresholds. Auto switch paused; resumes when quota recovers",
+  glmVerifyProgress: "Verifying candidate balances ({done}/{total}): {names}",
+  glmVerifyPending: "Waiting for verification…",
   glmLowQuotaActionTitle: "Action on low quota",
   glmLowQuotaActionSwitch: "Auto switch plan/account",
   glmLowQuotaActionDescSwitch:
@@ -825,6 +829,8 @@ const ru: Texts = {
   glmPointThresholdDesc: "Смена, когда любой бакет баллов (5 ч/неделя/месяц) ниже этого значения",
   pointUnit: "баллы",
   glmAutoSwitchPaused: "Все аккаунты ниже порогов по токенам/баллам. Автосмена приостановлена; возобновится при восстановлении квоты",
+  glmVerifyProgress: "Проверка балансов кандидатов ({done}/{total}): {names}",
+  glmVerifyPending: "Ожидание результата проверки…",
   glmLowQuotaActionTitle: "Действие при низкой квоте",
   glmLowQuotaActionSwitch: "Автосмена тарифа/аккаунта",
   glmLowQuotaActionDescSwitch:

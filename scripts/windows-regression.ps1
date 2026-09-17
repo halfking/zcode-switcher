@@ -10,22 +10,33 @@
       2. Switcher 与 ZCode 进程运行在交互登录用户（console 会话）下，而不是 SYSTEM。
       3. ~/.zcode/v2/credentials.json 存在、可解析，敏感字符串字段为 enc:v1: 密文。
       4. Switcher 账号池 profiles.json 可读，且每个档案的凭据副本均为 enc:v1: 密文。
-      5. ZCode 以 --remote-debugging-port=9229 启动，CDP 上存在 renderer 页面。
+      5. zcode.cdp：仅当 ZCode 是带 --remote-debugging-port=9229（增强启动）拉起时
+         才要求 CDP 上存在 renderer 页面；用户手动启动的 ZCode 没有调试端口是正常
+         状态，记为 SKIP 而不是 FAIL。带 -RepairCdp 时会用增强参数重启 ZCode（先
+         复用 Switcher 记录的 exe 路径，回落到运行中进程/常见安装位置）后再复查。
 
     脚本只输出路径、版本、计数、布尔值与掩码后的邮箱，绝不输出任何 token / 密文内容。
 
 .PARAMETER ExpectedVersion
-    期望的 Switcher 版本号，默认 1.1.14。
+    期望的 Switcher 版本号，默认 1.1.17。
+
+.PARAMETER RepairCdp
+    一键修复：当 ZCode 未带调试参数运行时，用 --remote-debugging-port=<CdpPort>
+    重启 ZCode（会先结束当前 ZCode 进程），然后复查 CDP。
 
 .EXAMPLE
     powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows-regression.ps1
 
 .EXAMPLE
-    powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows-regression.ps1 -ExpectedVersion 1.1.16
+    powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows-regression.ps1 -ExpectedVersion 1.1.17
+
+.EXAMPLE
+    powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows-regression.ps1 -RepairCdp
 #>
 param(
-    [string]$ExpectedVersion = "1.1.16",
-    [int]$CdpPort = 9229
+    [string]$ExpectedVersion = "1.1.17",
+    [int]$CdpPort = 9229,
+    [switch]$RepairCdp
 )
 
 $ErrorActionPreference = 'Stop'
@@ -193,24 +204,122 @@ if (Test-Path $profilesPath) {
 }
 
 # ---- 5. ZCode CDP（9229） ------------------------------------------------------
-# /json/list 偶发瞬时不稳定（进程忙时可能短暂返回空列表），最多重试 3 次。
-$cdpPage = $null
-$cdpLastError = ''
-foreach ($attempt in 1..3) {
-    try {
-        $list = Invoke-RestMethod -Uri ("http://127.0.0.1:{0}/json/list" -f $CdpPort) -TimeoutSec 5
-        $cdpPage = @($list) | Where-Object { $_.type -eq 'page' -and $_.url -like '*renderer/index.html*' } | Select-Object -First 1
-        if ($cdpPage) { break }
-        $cdpLastError = 'no renderer/index.html page'
-    } catch {
-        $cdpLastError = $_.Exception.Message
+# 只有 ZCode 由增强启动（命令行带 --remote-debugging-port=9229）拉起时，CDP 才是
+# 本工具链路的必要条件；用户手动启动的 ZCode 没有调试端口属于正常环境状态，
+# 记为 SKIP，不再当作回归失败。-RepairCdp 提供一键修复：带增强参数重启 ZCode。
+$debugFlag = "--remote-debugging-port={0}" -f $CdpPort
+$zcodeCmdlines = @()
+try {
+    $zcodeCmdlines = @(Get-CimInstance Win32_Process -Filter "Name='ZCode.exe'" |
+        Where-Object { $_.SessionId -eq 1 } |
+        ForEach-Object { [string]$_.CommandLine } |
+        Where-Object { $_ })
+} catch { }
+$launchedWithFlag = @($zcodeCmdlines | Where-Object { $_.Contains($debugFlag) }).Count -gt 0
+
+function Test-CdpRenderer {
+    # /json/list 偶发瞬时不稳定（进程忙时可能短暂返回空列表），最多重试 3 次。
+    $cdpPage = $null
+    $cdpLastError = ''
+    foreach ($attempt in 1..3) {
+        try {
+            $list = Invoke-RestMethod -Uri ("http://127.0.0.1:{0}/json/list" -f $CdpPort) -TimeoutSec 5
+            $cdpPage = @($list) | Where-Object { $_.type -eq 'page' -and $_.url -like '*renderer/index.html*' } | Select-Object -First 1
+            if ($cdpPage) { break }
+            $cdpLastError = 'no renderer/index.html page'
+        } catch {
+            $cdpLastError = $_.Exception.Message
+        }
+        Start-Sleep -Seconds 2
     }
-    Start-Sleep -Seconds 2
+    return @{ Page = $cdpPage; Error = $cdpLastError }
 }
-if ($cdpPage) {
-    Write-Pass 'zcode.cdp' ("port={0} renderer page present" -f $CdpPort)
+
+function Repair-ZcodeWithDebugFlag([string]$flag) {
+    # 优先用 Switcher 自己记录的 exe 路径（restart.rs 的 settings_file），回落到
+    # 运行中进程的可执行路径，最后试常见安装位置。
+    $exe = $null
+    $settingsPath = Join-Path $env:USERPROFILE '.zcode\v2\zcode-switcher-settings.json'
+    if (Test-Path $settingsPath) {
+        try {
+            $settings = Get-Content $settingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($settings.zcode_exe_path -and (Test-Path $settings.zcode_exe_path)) {
+                $exe = $settings.zcode_exe_path
+            }
+        } catch { }
+    }
+    if (-not $exe) {
+        try {
+            $proc = Get-CimInstance Win32_Process -Filter "Name='ZCode.exe'" | Select-Object -First 1
+            if ($proc -and $proc.ExecutablePath -and (Test-Path $proc.ExecutablePath)) {
+                $exe = $proc.ExecutablePath
+            }
+        } catch { }
+    }
+    if (-not $exe) {
+        foreach ($cand in @(
+            (Join-Path $env:LOCALAPPDATA 'Programs\ZCode\ZCode.exe'),
+            (Join-Path $env:ProgramFiles 'ZCode\ZCode.exe')
+        )) {
+            if (Test-Path $cand) { $exe = $cand; break }
+        }
+    }
+    if (-not $exe) {
+        Write-Output ("[REPAIR] zcode.cdp -- 找不到 ZCode.exe，无法自动修复")
+        return $false
+    }
+
+    Write-Output ("[REPAIR] zcode.cdp -- 结束 ZCode 并以 '{0}' 重启: {1}" -f $flag, $exe)
+    try {
+        Get-CimInstance Win32_Process -Filter "Name='ZCode.exe'" |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    } catch { }
+    $deadline = (Get-Date).AddSeconds(15)
+    while ((Get-Date) -lt $deadline) {
+        $left = @(Get-CimInstance Win32_Process -Filter "Name='ZCode.exe'" -ErrorAction SilentlyContinue)
+        if ($left.Count -eq 0) { break }
+        Start-Sleep -Milliseconds 300
+    }
+    try {
+        Start-Process -FilePath $exe -ArgumentList $flag | Out-Null
+    } catch {
+        Write-Output ("[REPAIR] zcode.cdp -- 启动失败: {0}" -f $_.Exception.Message)
+        return $false
+    }
+    return $true
+}
+
+if (-not $launchedWithFlag) {
+    if ($zcodeCmdlines.Count -eq 0) {
+        Write-Output ("[SKIP] zcode.cdp -- ZCode 未运行（进程检查已在上面单独判定），不要求 CDP")
+    } else {
+        Write-Output ("[SKIP] zcode.cdp -- ZCode 未带 {0} 启动（非增强启动拉起），不要求 CDP；可加 -RepairCdp 一键修复" -f $debugFlag)
+    }
+    if ($RepairCdp) {
+        $repaired = Repair-ZcodeWithDebugFlag $debugFlag
+        if ($repaired) {
+            # 等 Electron 起来并打开 CDP 端口。
+            $cdpReady = $null
+            $repairDeadline = (Get-Date).AddSeconds(30)
+            while ((Get-Date) -lt $repairDeadline) {
+                Start-Sleep -Seconds 2
+                $probe = Test-CdpRenderer
+                if ($probe.Page) { $cdpReady = $probe.Page; break }
+            }
+            if ($cdpReady) {
+                Write-Pass 'zcode.cdp' ("port={0} renderer page present (after repair)" -f $CdpPort)
+            } else {
+                Write-Fail 'zcode.cdp' ("port={0}: repair applied but CDP still unavailable" -f $CdpPort)
+            }
+        }
+    }
 } else {
-    Write-Fail 'zcode.cdp' ("port={0}: {1}" -f $CdpPort, $cdpLastError)
+    $probe = Test-CdpRenderer
+    if ($probe.Page) {
+        Write-Pass 'zcode.cdp' ("port={0} renderer page present" -f $CdpPort)
+    } else {
+        Write-Fail 'zcode.cdp' ("port={0}: {1}" -f $CdpPort, $probe.Error)
+    }
 }
 
 # ---- 汇总 ----------------------------------------------------------------------
