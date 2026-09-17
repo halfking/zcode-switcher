@@ -1626,6 +1626,14 @@ fn ensure_start_plan_entry_credentials(family: &str) -> R<()> {
 /// 优先走 CDP（渲染层 settingService.update，运行中的 ZCode 立即生效——
 /// 实测 ZCode 不监听 setting.json 外部修改，直接改文件只对下次启动有效）；
 /// CDP 不可用时退回直接写 setting.json，返回 applied_live=false。
+///
+/// **不变量：本函数及其调用路径不得调用 `crate::restart::kill_zcode_for_switch`
+/// 或 `crate::restart::restart_zcode`。** 同一切套餐操作必须保持 ZCode
+/// 进程运行——kill ZCode 会中断用户当前正在执行的对话/任务，与
+/// "切换套餐不影响当前正在执行的任务"的产品契约冲突。回归防护见
+/// `scripts/auto-switch-regression.mjs` 的 S8a / S8b 用例：两者均断言
+/// 切套餐路径上 `kill_zcode_for_switch` 调用次数为 0；若以后此约束被
+/// 打破（即使出于 in-place 路径想"立刻生效"），回归会立即失败。
 pub async fn switch_plan_internal(target: &str) -> Result<PlanSwitchOutcome, String> {
     let (selected_key, family) = plan_selected_key(target)?;
 

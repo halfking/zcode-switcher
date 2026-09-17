@@ -607,6 +607,10 @@ async function maybeSwitchGlm52Account(getStore: () => AppState) {
             "info"
           );
           const outcome = await api.switchPlan(target);
+          // 不变量：切套餐路径上绝对不得调用 api.killZcodeForSwitch() /
+          // api.restartZcode()。in-place 路径（applied_live=false）只在
+          // 下方 autoRestart && !tryNoRestartSwitch 时才允许 restartZcode，
+          // 但仍不允许 kill。回归防护见 auto-switch-regression.mjs S8a/S8b。
           lastPlanSwitchFailed = false;
           switched = true;
           if (outcome.applied_live) {

@@ -386,3 +386,38 @@ npm run tauri build
 - 后端切换: `src-tauri/src/profile.rs` (switch_plan_internal)
 - UI界面: `src/components/SettingsPanel.tsx`
 - 国际化: `src/i18n.ts`
+
+---
+
+## 不变量：同一切套餐路径不终止 ZCode 进程
+
+### 语义
+
+当用户触发**同一账户内不同套餐**的切换时（手动或由 quota-guard 自动触发），ZCode 中**正在执行的任务/对话不能被打断**。终止 ZCode 进程（kill）只允许发生在**跨账户切换**路径上，由独立命令 `kill_zcode_for_switch` 触发，且受 `autoRestart && !tryNoRestartSwitch` 三重门控。
+
+### 实现层面的保证
+
+| 路径 | 文件:行 | 行为 |
+|---|---|---|
+| `switch_plan` IPC 入口 | `src-tauri/src/profile.rs:1696-1698` | 唯一对外暴露的套餐切换命令 |
+| `switch_plan_internal` | `src-tauri/src/profile.rs:1629-1692` | 优先 CDP 实时注入 `settingService.update`；不可用回退 in-place 文件写。**全程不调用 `kill_zcode_for_switch` / `restart_zcode`** |
+| 前端调用点 | `src/store.ts:609` | `api.switchPlan` 在自动切换路径里是唯一调用点，且所在 `try` 块不调 `killZcodeForSwitch` |
+| in-place 分支重启 | `src/store.ts:630-633` | `applied_live=false && autoRestart && !tryNoRestartSwitch` 时调 `restartZcode`，但**仍不调 `killZcodeForSwitch`**（in-place 写入的 setting.json 在重启后自然生效，不需要预杀进程） |
+| 跨账户切换 | `src/store.ts:846-898` | 才允许调 `killZcodeForSwitch`，且三重门控 |
+
+`grep -n "killZcodeForSwitch\|kill_zcode_for_switch\|restartZcode\|restart_zcode" src-tauri/src/profile.rs` 在 `profile.rs` 内仅出现在 `switch_to` 相关路径，与 `switch_plan_internal` 完全隔离。
+
+### 回归防护
+
+`scripts/auto-switch-regression.mjs` 新增两个独立子进程场景：
+
+- **S8a — CDP live 路径**：stub 返回 `applied_live=true`，断言切套餐路径上 `kill_zcode_for_switch` 和 `restart_zcode` 调用次数均为 0。
+- **S8b — in-place 路径**：stub 返回 `applied_live=false` 且 store 设 `autoRestart=true`，断言 `restart_zcode` 会被调用但 `kill_zcode_for_switch` 调用次数仍为 0。
+
+反向验证已通过：在 `store.ts:609` 前后临时插入 `await api.killZcodeForSwitch()` 模拟回归后，S8a 与 S8b 立刻失败，错误信息精确指出 kill 调用位置，确认这两条用例真正起防护作用。
+
+### 维护者须知
+
+- 不要在 `switch_plan_internal`（或调用它的任何代码）里调 `kill_zcode_for_switch` / `restart_zcode` —— 这违反"切套餐不影响当前任务"契约。
+- 不要把 `killZcodeForSwitch` 移到 store 切套餐路径里 —— S8a/S8b 会失败。
+- 若未来增加新的套餐入口（如第三种 plan 入口），只需扩展 `pickPlanSwitchTarget` 与 `entryOfBalance`，切套餐路径上的"不终止进程"不变量保持不变。

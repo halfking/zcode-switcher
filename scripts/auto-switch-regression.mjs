@@ -12,6 +12,13 @@
 //        候选"；验证进度经 switchVerifyProgress 实时暴露并在结束后清空。
 //   S7   单候选超时：复核请求挂死的候选在 candidateVerifyTimeoutMs 后按
 //        不合格跳过，切换落 to 后续合格候选，整体流程不被挂死拖住。
+//   S8a  切套餐不得影响当前正在执行的任务（CDP live 路径）：
+//        applied_live=true 时 kill_zcode_for_switch 和 restart_zcode
+//        调用次数都必须为 0。
+//   S8b  切套餐不得影响当前正在执行的任务（in-place 路径）：
+//        applied_live=false 且 autoRestart=true 时 store 会调
+//        restartZcode 让配置生效，但 kill_zcode_for_switch 仍必须为 0。
+//        这是切套餐 ≠ 切号这条不变量在回归测试层的强制约束。
 //
 // store 模块内有跨调用的冷却/守护状态，每个场景在独立子进程中运行，
 // 保证互不污染。失败时 exit 1（并保留临时 bundle 目录供排查）。
@@ -69,7 +76,8 @@ const coreStub = `
     if (command === "switch_plan") {
       (globalThis.__switchPlans ||= []).push(args);
       if (globalThis.__failSwitchPlan) throw new Error("coding-plan 入口没有 API Key（测试注入）");
-      return { selected_key: "coding-plan:builtin:bigmodel-coding-plan", applied_live: true };
+      const live = globalThis.__planNotLive ? false : true;
+      return { selected_key: "coding-plan:builtin:bigmodel-coding-plan", applied_live: live };
     }
     if (command === "set_quota_guard") {
       return { paused: !!(args && args.paused), reason: null, updated_at: 0 };
@@ -256,6 +264,54 @@ const scenarios: Record<string, () => Promise<void>> = {
       "挂死候选应被超时跳过并切到 C，实际 " + JSON.stringify(sw));
     assert(state().autoSwitchPaused === false, "切到合格候选后不应进入自动暂停");
   },
+
+  async S8a() {
+    // 切套餐不得影响当前正在执行的任务（CDP live 路径）：
+    // kill_zcode_for_switch / restart_zcode 调用次数都必须为 0。
+    // 单帐号 + 当前 start-plan 入口低、coding-plan 入口充足，
+    // stub 返回 applied_live=true；store 应只调 switch_plan。
+    await arm(["A"], "A", {
+      A: () => ({
+        balances: [tok(0), pt(5000)],
+        active_provider: "coding-plan:builtin:bigmodel-start-plan",
+      }),
+    });
+    await cycle();
+    assert(calls("switch_plan").length === 1,
+      "S8a 应执行切套餐，实际 " + JSON.stringify(calls("switch_plan")));
+    assert(calls("kill_zcode_for_switch").length === 0,
+      "S8a CDP live 路径不得调用 kill_zcode_for_switch，实际 " +
+        JSON.stringify(calls("kill_zcode_for_switch")));
+    assert(calls("restart_zcode").length === 0,
+      "S8a CDP live 路径不得调用 restart_zcode，实际 " +
+        JSON.stringify(calls("restart_zcode")));
+  },
+
+  async S8b() {
+    // 切套餐不得影响当前正在执行的任务（in-place 路径）：
+    // applied_live=false 且 autoRestart=true 时 store.ts:630-633
+    // 会调 restartZcode 让配置生效，但 kill_zcode_for_switch 仍必须为 0。
+    // 这是当前实现编码的不变量：切套餐 ≠ 切号，kill 永远不进切套餐路径。
+    (globalThis as any).__planNotLive = true;
+    await arm(["A"], "A", {
+      A: () => ({
+        balances: [tok(0), pt(5000)],
+        active_provider: "coding-plan:builtin:bigmodel-start-plan",
+      }),
+    });
+    useStore.setState({ autoRestart: true, tryNoRestartSwitch: false });
+    try {
+      await cycle();
+    } finally {
+      (globalThis as any).__planNotLive = false;
+    }
+    assert(calls("switch_plan").length === 1,
+      "S8b in-place 路径应执行切套餐，实际 " + JSON.stringify(calls("switch_plan")));
+    // 关键不变量：即便走 restart 分支，kill 也必须为 0。
+    assert(calls("kill_zcode_for_switch").length === 0,
+      "S8b in-place 路径也绝对不得调用 kill_zcode_for_switch（切套餐≠切号），实际 " +
+        JSON.stringify(calls("kill_zcode_for_switch")));
+  },
 };
 
 export async function runScenario(name: string) {
@@ -304,7 +360,7 @@ await build({
 });
 
 let failed = 0;
-for (const name of ["S1", "S2", "S3S4", "S5", "S6", "S7"]) {
+for (const name of ["S1", "S2", "S3S4", "S5", "S6", "S7", "S8a", "S8b"]) {
   const r = spawnSync(process.execPath, [bundle, name], { encoding: "utf8" });
   if (r.status !== 0) {
     failed += 1;
