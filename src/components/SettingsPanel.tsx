@@ -369,6 +369,8 @@ export default function SettingsPanel() {
     setGlm52AutoSwitchPointThreshold,
     glm52LowQuotaAction,
     setGlm52LowQuotaAction,
+    glm52ExhaustRestartZcode,
+    setGlm52ExhaustRestartZcode,
     autoRestart,
     setAutoRestart,
     tryNoRestartSwitch,
@@ -573,6 +575,19 @@ export default function SettingsPanel() {
           <option value="switch">{t.glmLowQuotaActionSwitch}</option>
           <option value="pause">{t.glmLowQuotaActionPause}</option>
         </select>
+      </Row>
+
+      <Row
+        icon={<Clock size={15} />}
+        title={t.glmExhaustRestartTitle}
+        desc={t.glmExhaustRestartDesc}
+      >
+        <Toggle
+          on={glm52ExhaustRestartZcode}
+          onClick={() =>
+            setGlm52ExhaustRestartZcode(!glm52ExhaustRestartZcode)
+          }
+        />
       </Row>
 
       <Row

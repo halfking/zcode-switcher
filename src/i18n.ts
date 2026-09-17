@@ -170,6 +170,9 @@ const zh = {
   glmLowQuotaActionPause: "暂停执行",
   glmLowQuotaActionDescPause:
     "低于阈值时拦截模型请求并暂停自动切换，等待人工处理。请求拦截需开启本地网关并让 ZCode 走网关。",
+  glmExhaustRestartTitle: "耗尽时重启 ZCode",
+  glmExhaustRestartDesc:
+    "所有账号/套餐均低于阈值（暂停模式为首次触发）时，重启 ZCode 强制停止所有在途任务，防止余额被继续消耗。在途请求不受请求拦截影响，只有重启进程才能止损。",
   planEntryStart: "Start Plan 套餐",
   planEntryCoding: "GLM Coding Plan 套餐",
   glmAutoSwitchingPlan: "当前套餐余额低于阈值，切换到「{plan}」",
@@ -505,6 +508,9 @@ const en: Texts = {
   glmLowQuotaActionPause: "Pause execution",
   glmLowQuotaActionDescPause:
     "Block model requests and stop auto switching until handled manually. Request blocking requires the local gateway with ZCode routed through it.",
+  glmExhaustRestartTitle: "Restart ZCode on exhaustion",
+  glmExhaustRestartDesc:
+    "When every account/plan is below the threshold (or pause mode first fires), restart ZCode to force-stop all in-flight tasks and stop the remaining balance from draining. In-flight requests are not blocked by request interception; only a restart stops them.",
   planEntryStart: "Start Plan",
   planEntryCoding: "GLM Coding Plan",
   glmAutoSwitchingPlan: "Current plan is below the threshold, switching to \"{plan}\"",
@@ -838,6 +844,9 @@ const ru: Texts = {
   glmLowQuotaActionPause: "Пауза выполнения",
   glmLowQuotaActionDescPause:
     "Блокировать запросы и остановить автосмену до ручного вмешательства. Блокировка требует локального шлюза с маршрутом ZCode через него.",
+  glmExhaustRestartTitle: "Перезапускать ZCode при исчерпании",
+  glmExhaustRestartDesc:
+    "Когда все аккаунты/тарифы ниже порога (или пауза срабатывает впервые), ZCode перезапускается, чтобы принудительно остановить все запущенные задачи и не дать остатку квоты сгореть. Идущие запросы не блокируются перехватом; остановить их может только перезапуск.",
   planEntryStart: "Start Plan",
   planEntryCoding: "GLM Coding Plan",
   glmAutoSwitchingPlan: "Текущий тариф ниже порога, переключение на «{plan}»",

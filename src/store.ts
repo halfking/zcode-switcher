@@ -107,6 +107,12 @@ interface AppState {
   /** 低额度时的动作方式（见 LowQuotaAction 注释） */
   glm52LowQuotaAction: LowQuotaAction;
   /**
+   * 余额耗尽兜底：无可切换目标进入自动暂停（或暂停模式首次触发）时，
+   * 重启 ZCode 强制停止所有在途任务。在途请求不受网关 429 拦截影响，
+   * 只有终止进程才能阻止它们把剩余余额烧穿。
+   */
+  glm52ExhaustRestartZcode: boolean;
+  /**
    * 无可切换账号时的自动暂停标记（会话内状态，不持久化）：
    * 暂停期间不做任何切换尝试（监测回落到慢速档），防止在低额度
    * 账号之间循环切换；当前账号恢复、出现满足双阈值的候选账号或
@@ -165,6 +171,7 @@ interface AppState {
   setGlm52AutoSwitchThresholdWan: (v: number) => void;
   setGlm52AutoSwitchPointThreshold: (v: number) => void;
   setGlm52LowQuotaAction: (v: LowQuotaAction) => void;
+  setGlm52ExhaustRestartZcode: (v: boolean) => void;
   setAutoSwitchPaused: (v: boolean) => void;
   setSwitchVerifyProgress: (p: SwitchVerifyProgress | null) => void;
   setAutoRestart: (v: boolean) => void;
@@ -352,6 +359,14 @@ function loadGlm52LowQuotaAction(): LowQuotaAction {
     return DEFAULT_LOW_QUOTA_ACTION;
   }
 }
+/** 缺省开启：阈值触发且无可用切换时，重启 ZCode 是唯一能止住在途消耗的手段。 */
+function loadGlm52ExhaustRestartZcode(): boolean {
+  try {
+    return localStorage.getItem("zcs:glm52ExhaustRestartZcode") !== "0";
+  } catch {
+    return true;
+  }
+}
 function loadTheme(): Theme {
   try {
     const t = localStorage.getItem("zcs:theme");
@@ -514,6 +529,49 @@ function applyTheme(theme: Theme) {
  *   （双阈值全部达标才合格），只切到第一个验证通过的帐号；全部不通过
  *   则进入自动暂停，不做任何切换。
  */
+/**
+ * 耗尽硬停兜底：按设置重启 ZCode 强制停止所有在途任务。
+ *
+ * 背景（2026-09-18 线上事故）：阈值触发后 ZCode 并不会自己停下来——网关
+ * 429 只能拦新请求，正在流式执行的任务会一路跑到上游硬耗尽。唯一可靠的
+ * 止损手段是终止 ZCode 进程。仅在 ZCode 正在运行时执行；用户手动操作
+ * （busy）期间不抢动作。
+ */
+async function restartZcodeIfArmed(getStore: () => AppState) {
+  if (!getStore().glm52ExhaustRestartZcode) return;
+  try {
+    const running = await api.zcodeRunning();
+    if (!running) return;
+  } catch {
+    // 探测失败照常尝试重启：重启命令自身失败会有明确的 toast。
+  }
+  if (getStore().busy) return;
+  await getStore().restartZcode();
+}
+
+/**
+ * 进入"无可切换目标"的自动暂停回合：
+ * 1. 落 autoSwitchPaused 标记（每回合只提示/重启一次）；
+ * 2. 开启网关拦截（幂等）：代理在链路上时新请求即刻 429；
+ * 3. 按设置重启 ZCode 硬停在途任务。
+ * 注意：进入暂停前 switch 模式的每轮循环会清拦截，暂停期间由本函数
+ * 每轮重新加回，保证拦截不会在暂停中意外缺席。
+ */
+async function enterExhaustionPause(
+  getStore: () => AppState,
+  t: ReturnType<typeof getTexts>
+) {
+  const live = getStore();
+  const first = !live.autoSwitchPaused;
+  if (first) {
+    live.setAutoSwitchPaused(true);
+    live.toast(t.glmAutoSwitchPaused, "warn");
+  }
+  void api.setQuotaGuard(true, t.glmGuardReason).catch(() => {});
+  if (!first) return;
+  await restartZcodeIfArmed(getStore);
+}
+
 async function maybeSwitchGlm52Account(getStore: () => AppState) {
   const state = getStore();
   const t = getTexts(state.language);
@@ -541,20 +599,31 @@ async function maybeSwitchGlm52Account(getStore: () => AppState) {
       // 积分均低于阈值"，与本模式无关，否则全局 UI 文案会不一致）。
       guardPauseNotified = true;
       state.toast(t.glmGuardPaused, "warn");
+      // 拦截挡不住在途请求：首次触发时同样按设置硬停，否则正在执行
+      // 的任务会把剩余余额一路烧穿（与切换模式共用同一兜底设置）。
+      await restartZcodeIfArmed(getStore);
     }
     return;
   }
 
-  // 切换模式：清掉可能残留的网关拦截。
-  if (guardPauseNotified) {
-    guardPauseNotified = false;
-    state.toast(t.glmGuardResumed, "success");
+  // 切换模式：未暂停时清掉可能残留的网关拦截。暂停期间必须保持拦截
+  // ——清了它新请求就会继续打在耗尽的账号上把余额烧穿；暂停中的
+  // 拦截由 enterExhaustionPause 每轮重新加回。
+  if (!state.autoSwitchPaused) {
+    if (guardPauseNotified) {
+      guardPauseNotified = false;
+      state.toast(t.glmGuardResumed, "success");
+    }
+    void api.setQuotaGuard(false, "").catch(() => {});
   }
-  void api.setQuotaGuard(false, "").catch(() => {});
 
   // 当前入口余额充足（或入口未知且整帐号判定未触发）→ 无需动作。
   if (!currentLow) {
-    if (state.autoSwitchPaused) state.setAutoSwitchPaused(false);
+    if (state.autoSwitchPaused) {
+      // 恢复：解除暂停并放行网关，回到常规切换判定。
+      state.setAutoSwitchPaused(false);
+      void api.setQuotaGuard(false, "").catch(() => {});
+    }
     return;
   }
 
@@ -586,7 +655,10 @@ async function maybeSwitchGlm52Account(getStore: () => AppState) {
         const freshOk = !!freshActive && !freshActive.error;
         if (freshOk && !isCurrentEntryLow(freshActive, tokenWan, pointThreshold)) {
           // 复核发现当前入口余额已恢复：无需任何切换。
-          if (getStore().autoSwitchPaused) getStore().setAutoSwitchPaused(false);
+          if (getStore().autoSwitchPaused) {
+            getStore().setAutoSwitchPaused(false);
+            void api.setQuotaGuard(false, "").catch(() => {});
+          }
           return;
         }
         if (
@@ -674,10 +746,9 @@ async function maybeSwitchGlm52Account(getStore: () => AppState) {
     // 所有账号的 token/积分都低于阈值：进入自动暂停——暂停期间不做任何
     // 切换尝试（不会在低额度账号间循环切换），监测也回落到慢速档；
     // 仅提示一次，等任一账号额度恢复到双阈值之上后自动继续。
-    if (!getStore().autoSwitchPaused) {
-      getStore().setAutoSwitchPaused(true);
-      state.toast(t.glmAutoSwitchPaused, "warn");
-    }
+    // 同时开启网关拦截并按设置重启 ZCode 硬停在途任务：阈值触发后
+    // ZCode 不会自己停，拦截只挡新请求，在途任务只有终止进程才能止损。
+    await enterExhaustionPause(getStore, t);
     return;
   }
 
@@ -720,11 +791,8 @@ async function maybeSwitchGlm52Account(getStore: () => AppState) {
 
     if (!verified) {
       // 逐一验证后没有任何帐号余额达标：宁可暂停也绝不切换。
-      const live = getStore();
-      if (!live.autoSwitchPaused) {
-        live.setAutoSwitchPaused(true);
-        state.toast(t.glmAutoSwitchPaused, "warn");
-      }
+      // 拦截 + 硬停语义与候选为空的分支一致。
+      await enterExhaustionPause(getStore, t);
       return;
     }
 
@@ -780,6 +848,7 @@ export const useStore = create<AppState>((set, get) => {
     glm52AutoSwitchThresholdWan: loadGlm52AutoSwitchThresholdWan(),
     glm52AutoSwitchPointThreshold: loadGlm52AutoSwitchPointThreshold(),
     glm52LowQuotaAction: loadGlm52LowQuotaAction(),
+    glm52ExhaustRestartZcode: loadGlm52ExhaustRestartZcode(),
     autoSwitchPaused: false,
     switchVerifyProgress: null,
     candidateVerifyConcurrency: DEFAULT_VERIFY_CONCURRENCY,
@@ -1161,6 +1230,15 @@ export const useStore = create<AppState>((set, get) => {
       void api.setQuotaGuard(false, "").catch(() => {});
     }
     set({ glm52LowQuotaAction: v });
+  },
+
+  setGlm52ExhaustRestartZcode: (v) => {
+    try {
+      localStorage.setItem("zcs:glm52ExhaustRestartZcode", v ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+    set({ glm52ExhaustRestartZcode: v });
   },
 
   setGlm52AutoSwitchThresholdWan: (v) => {

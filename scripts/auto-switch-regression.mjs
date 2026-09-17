@@ -19,6 +19,11 @@
 //        applied_live=false 且 autoRestart=true 时 store 会调
 //        restartZcode 让配置生效，但 kill_zcode_for_switch 仍必须为 0。
 //        这是切套餐 ≠ 切号这条不变量在回归测试层的强制约束。
+//   S9   耗尽兜底（重启关）：所有账号/套餐低于阈值进入自动暂停时开启
+//        网关拦截（paused=true），不重启、不切换。
+//   S10  耗尽兜底（重启开）：恰好重启一次 ZCode 硬停在途任务；同一
+//        暂停回合内重复刷新不反复重启，但每轮重新确保拦截在位。
+//   S11  恢复放行：暂停期间余额恢复 → 解除暂停并清除网关拦截。
 //
 // store 模块内有跨调用的冷却/守护状态，每个场景在独立子进程中运行，
 // 保证互不污染。失败时 exit 1（并保留临时 bundle 目录供排查）。
@@ -82,6 +87,11 @@ const coreStub = `
     if (command === "set_quota_guard") {
       return { paused: !!(args && args.paused), reason: null, updated_at: 0 };
     }
+    if (command === "zcode_running") {
+      // 耗尽硬停路径会先探测 ZCode 是否在运行；默认报"在运行"，
+      // __zcodeRunning === false 时报"未运行"。
+      return globalThis.__zcodeRunning === false ? null : "C:\\zcode\\ZCode.exe";
+    }
     return null;
   }
 `;
@@ -122,6 +132,9 @@ async function arm(ids: string[], activeId: string, scripts: Record<string, (cal
   st.setGlm52AutoSwitchEnabled(true);
   st.setGlm52AutoSwitchThresholdWan(THRESHOLD_WAN);
   st.setGlm52AutoSwitchPointThreshold(POINT_THRESHOLD);
+  // 耗尽硬停默认关闭，保持老场景（S1-S7）行为不受新特性影响；
+  // S10 显式打开验证重启语义。
+  st.setGlm52ExhaustRestartZcode(false);
   useStore.setState({
     profiles: ids.map((id) => profile(id, id === activeId)),
     quotas: {},
@@ -312,6 +325,71 @@ const scenarios: Record<string, () => Promise<void>> = {
       "S8b in-place 路径也绝对不得调用 kill_zcode_for_switch（切套餐≠切号），实际 " +
         JSON.stringify(calls("kill_zcode_for_switch")));
   },
+
+  async S9() {
+    // 耗尽兜底（重启关）：所有账号/套餐均低于阈值进入自动暂停时，
+    // 必须开启网关拦截（set_quota_guard paused=true），且不重启 ZCode、
+    // 不做任何切换。这是"阈值到了余额却被耗尽"事故的第一道防线。
+    await arm(["A"], "A", {
+      A: () => ({
+        balances: [tok(0), pt(0)],
+        active_provider: "coding-plan:builtin:bigmodel-start-plan",
+      }),
+    });
+    await cycle();
+    const guards = calls("set_quota_guard").filter((c: any) => c.args.paused === true);
+    assert(guards.length >= 1,
+      "进入耗尽暂停必须开启网关拦截，实际 " + JSON.stringify(calls("set_quota_guard")));
+    assert(calls("restart_zcode").length === 0,
+      "重启设置关闭时不得重启 ZCode，实际 " + JSON.stringify(calls("restart_zcode")));
+    assert(calls("switch_plan").length === 0, "耗尽时不得切套餐");
+    assert(calls("switch_to").length === 0, "耗尽时不得切账号");
+    assert(state().autoSwitchPaused === true, "应进入自动暂停");
+  },
+
+  async S10() {
+    // 耗尽兜底（重启开）：重启 ZCode 恰好一次（在途请求不受 429 影响，
+    // 只有终止进程才能止损）；暂停回合内重复刷新不得反复重启。
+    await arm(["A"], "A", {
+      A: () => ({
+        balances: [tok(0), pt(0)],
+        active_provider: "coding-plan:builtin:bigmodel-start-plan",
+      }),
+    });
+    useStore.setState({ glm52ExhaustRestartZcode: true });
+    await cycle();
+    assert(calls("restart_zcode").length === 1,
+      "耗尽且重启开启时应恰好重启一次 ZCode，实际 " +
+        JSON.stringify(calls("restart_zcode")));
+    // 第二轮：仍在暂停回合内（余额没有恢复）→ 只重新加拦截，不再次重启。
+    await cycle();
+    assert(calls("restart_zcode").length === 1,
+      "同一暂停回合内不得反复重启 ZCode，实际 " +
+        JSON.stringify(calls("restart_zcode")));
+    const guards = calls("set_quota_guard").filter((c: any) => c.args.paused === true);
+    assert(guards.length >= 2,
+      "暂停期间每轮都应确保拦截在位，实际 " + JSON.stringify(calls("set_quota_guard")));
+  },
+
+  async S11() {
+    // 恢复放行：暂停期间当前入口余额恢复 → 解除暂停并清除网关拦截，
+    // 不会带着拦截静默恢复正常执行。
+    await arm(["A"], "A", {
+      A: (n: number) => ({
+        balances: n === 1 ? [tok(0), pt(0)] : [tok(800)],
+        active_provider: "coding-plan:builtin:bigmodel-start-plan",
+      }),
+    });
+    await cycle(); // 触发耗尽暂停
+    assert(state().autoSwitchPaused === true, "第 1 轮应进入自动暂停");
+    await cycle(); // 余额恢复
+    assert(state().autoSwitchPaused === false, "余额恢复后应解除暂停");
+    const resumed = calls("set_quota_guard").filter((c: any) => c.args.paused === false);
+    assert(resumed.length >= 1,
+      "恢复后应清除网关拦截，实际 " + JSON.stringify(calls("set_quota_guard")));
+    const guards = calls("set_quota_guard").filter((c: any) => c.args.paused === true);
+    assert(guards.length >= 1, "恢复前应曾开启拦截");
+  },
 };
 
 export async function runScenario(name: string) {
@@ -360,7 +438,7 @@ await build({
 });
 
 let failed = 0;
-for (const name of ["S1", "S2", "S3S4", "S5", "S6", "S7", "S8a", "S8b"]) {
+for (const name of ["S1", "S2", "S3S4", "S5", "S6", "S7", "S8a", "S8b", "S9", "S10", "S11"]) {
   const r = spawnSync(process.execPath, [bundle, name], { encoding: "utf8" });
   if (r.status !== 0) {
     failed += 1;

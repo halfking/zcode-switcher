@@ -421,3 +421,37 @@ npm run tauri build
 - 不要在 `switch_plan_internal`（或调用它的任何代码）里调 `kill_zcode_for_switch` / `restart_zcode` —— 这违反"切套餐不影响当前任务"契约。
 - 不要把 `killZcodeForSwitch` 移到 store 切套餐路径里 —— S8a/S8b 会失败。
 - 若未来增加新的套餐入口（如第三种 plan 入口），只需扩展 `pickPlanSwitchTarget` 与 `entryOfBalance`，切套餐路径上的"不终止进程"不变量保持不变。
+
+---
+
+## 耗尽硬停：阈值触发后强制止损（2026-09-18 事故修复）
+
+### 事故与根因
+
+线上观察到"余额到阈值后 ZCode 没有停止工作，余额仍被耗尽"。根因有二：
+
+1. **switch 模式耗尽分支不开启网关拦截**：`maybeSwitchGlm52Account` 的两个耗尽分支（候选为空 / 逐一验证全部不合格）只落 `autoSwitchPaused` 标记并 toast，从不调用 `setQuotaGuard(true)`；且切换模式每轮循环会无条件清拦截。于是暂停后新请求继续打在耗尽的账号上，余额被一路烧穿。
+2. **在途请求永远不被拦截**：网关 429 只挡新请求，正在流式执行的任务会继续跑到上游硬耗尽。只要 ZCode 进程活着，就没有任何机制能阻止在途消耗。
+
+### 修复（两层防线）
+
+| 层 | 行为 | 位置 |
+|---|---|---|
+| 第一层：拦截新请求 | 进入耗尽暂停时 `setQuotaGuard(true, reason)`（幂等，暂停期间每轮重新确保）；代理在链路上时新请求即刻 429。恢复（当前入口余额回升 / 验证出合格候选 / 手动切号 / 关闭自动切换 / 切回切换模式）时解除。 | `src/store.ts` `enterExhaustionPause` + 暂停期间的守卫清理时序调整 |
+| 第二层：硬停在途任务 | 新设置 `glm52ExhaustRestartZcode`（默认**开启**，`zcs:glm52ExhaustRestartZcode`）：进入耗尽暂停首次触发（或暂停模式首次触发）时，先探测 `zcode_running`，运行中则 `restart_zcode`（kill 等待真正退出 → 快捷方式拉起，保留 CDP flag）强制停止所有在途任务。同一暂停回合内只执行一次。 | `src/store.ts` `restartZcodeIfArmed` + 两个耗尽分支 + 暂停模式首次触发分支 |
+
+设置项 UI 在设置面板"低额度时动作"下拉框下方（`SettingsPanel.tsx`），i18n key `glmExhaustRestartTitle` / `glmExhaustRestartDesc`（zh/en/ru）。
+
+### 与"切套餐不终止 ZCode"不变量的边界
+
+上一节不变量**不被破坏**：切套餐路径（`switch_plan` / S8a / S8b）仍然绝不触碰 ZCode 进程。`restart_zcode` 只出现在**耗尽路径**——此时已经没有任何可切换的套餐/账号，不存在"切换"动作，重启是纯粹的止损兜底，且受独立设置门控、每个暂停回合至多一次。
+
+### 回归防护
+
+`scripts/auto-switch-regression.mjs` 新增三个场景（stub 增加 `zcode_running` 探测支持；`arm()` 默认关闭重启设置，老场景不受影响）：
+
+- **S9**：重启关 → 耗尽时必须开启拦截（paused=true）、不重启、不切换、落暂停标记。
+- **S10**：重启开 → 恰好重启一次；同一暂停回合内第二轮只重新加拦截、不反复重启。
+- **S11**：恢复放行 → 暂停期间当前入口余额恢复，解除暂停并清除拦截，不带着拦截静默恢复。
+
+反向变异验证：临时删除 `enterExhaustionPause` 中的拦截调用后，S9/S10/S11 全部失败并给出精确断言信息；已还原。
