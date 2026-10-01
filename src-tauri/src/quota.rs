@@ -611,8 +611,8 @@ async fn fetch_coding_plan_usage(
 }
 
 /// 从 credentials.json 读出并解密 OAuth access_token
-/// （oauth:bigmodel:access_token，quota/limit 与 mcp/usage 都用它认证）。
-fn oauth_access_token(creds: &Value) -> Result<String, String> {
+/// （oauth:bigmodel:access_token，quota/limit 与重置卡接口都用它认证）。
+pub fn oauth_access_token(creds: &Value) -> Result<String, String> {
     let oauth_token = creds
         .get("oauth:bigmodel:access_token")
         .and_then(|v| v.as_str())
@@ -1490,5 +1490,71 @@ mod tests {
             );
         }
         assert!(!info.balances.is_empty(), "balances 不应为空");
+    }
+
+    /// 探针（仅手动）：dump quota/limit 的原始 JSON，用来核对服务端新增字段
+    /// （如重置卡库存）。`cargo test --lib --release -- --ignored probe_quota_raw`
+    #[test]
+    #[ignore = "只读探针：依赖本机凭据与外网，仅手动运行"]
+    fn probe_quota_limit_raw_json() {
+        let home = dirs::home_dir().expect("home dir");
+        let text = std::fs::read_to_string(
+            home.join(".zcode").join("v2").join("credentials.json"),
+        )
+        .expect("credentials.json");
+        let creds: Value = serde_json::from_str(&text).expect("credentials json");
+        let token = oauth_access_token(&creds).expect("oauth token");
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                let client = reqwest::Client::new();
+                let resp = client
+                    .get("https://open.bigmodel.cn/api/monitor/usage/quota/limit")
+                    .header("Authorization", format!("Bearer {}", token))
+                    .send()
+                    .await
+                    .expect("请求");
+                println!("status={}", resp.status());
+                let raw = resp.text().await.expect("body");
+                let pretty = serde_json::to_string_pretty(
+                    &serde_json::from_str::<Value>(&raw).unwrap_or(Value::String(raw.clone())),
+                )
+                .unwrap_or(raw);
+                println!("{}", pretty);
+            });
+    }
+
+    /// 探针（仅手动，只读）：GET 重置卡库存列表，核对 list 接口的认证与响应
+    /// 结构。绝不调用 use（会消耗真实卡片）。
+    /// `cargo test --lib --release -- --ignored probe_reset_card_list`
+    #[test]
+    #[ignore = "只读探针：依赖本机凭据与外网，仅手动运行"]
+    fn probe_reset_card_list() {
+        let home = dirs::home_dir().expect("home dir");
+        let text = std::fs::read_to_string(
+            home.join(".zcode").join("v2").join("credentials.json"),
+        )
+        .expect("credentials.json");
+        let creds: Value = serde_json::from_str(&text).expect("credentials json");
+        let token = oauth_access_token(&creds).expect("oauth token");
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                let client = reqwest::Client::new();
+                let resp = client
+                    .get("https://open.bigmodel.cn/api/biz/customer-package-reset/list")
+                    .query(&[("targetType", "PERSONAL")])
+                    .header("Authorization", format!("Bearer {}", token))
+                    .send()
+                    .await
+                    .expect("请求");
+                println!("status={}", resp.status());
+                let raw = resp.text().await.expect("body");
+                let pretty = serde_json::to_string_pretty(
+                    &serde_json::from_str::<Value>(&raw).unwrap_or(Value::String(raw.clone())),
+                )
+                .unwrap_or(raw);
+                println!("{}", pretty);
+            });
     }
 }

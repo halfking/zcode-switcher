@@ -40,6 +40,7 @@ All account profiles are stored on your own computer and are not uploaded to any
 | Seamless switching | Switch accounts without restarting ZCode; config changes take effect immediately |
 | Quota display | Show quota, subscription status, and refresh results |
 | Reset windows | Quota cards show countdowns to 5-hour/weekly/monthly window resets; the toolbar counts cards per window; accounts auto-refresh when a window resets so exhausted states clear on their own |
+| Reset cards | Opt-in auto-use: when a window drops to ≤1% (adjustable), spend a reset card to refill it; weekly card is chosen when the weekly balance is ≤5% (adjustable) or exhausted, otherwise the 5-hour card; inventory display and manual use built in |
 | GLM-5.2 auto switching | On low quota, switch to another plan with balance inside the account first, then switch accounts once all plans are exhausted; a pause mode is also available for manual handling |
 | Capsule floating window | Show GLM-5.2 account pool stats and support resizing |
 | Scheduled refresh | Refresh quota by minute and keep the latest quota data after closing the app |

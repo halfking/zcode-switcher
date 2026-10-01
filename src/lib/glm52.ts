@@ -1,4 +1,4 @@
-import type { BalanceItem, PlanSummary, ProfileView, QuotaInfo } from "./api";
+import type { BalanceItem, PlanSummary, ProfileView, QuotaInfo, ResetCardType } from "./api";
 
 // 监听的模型：按 show_name（忽略大小写）子串匹配账号的额度条目。
 // "glm-5.3-flash" 本身包含 "glm-5.3"，显式列出以表达两个监听对象。
@@ -189,6 +189,62 @@ export function formatQuotaUnits(n: number): string {
   if (abs >= 1e8) return `${(n / 1e8).toFixed(2)} 亿`;
   if (abs >= 1e4) return `${(n / 1e4).toFixed(2)} 万`;
   return Math.round(n).toLocaleString();
+}
+
+// ---------------------------------------------------------------------------
+// 重置卡决策：用量见底（默认 ≤1%）时先用卡回满窗口，赶在窗口真正打尽、
+// 请求被拒导致业务中断之前；选卡看周余额（默认 ≤5% 或用尽用周卡，因为
+// 周卡同时回满 5 小时窗口；否则用 5 小时卡）。
+// ---------------------------------------------------------------------------
+
+/** 指定周期（"5h"/"weekly"/"monthly"）积分窗口的剩余百分比（0-100）；
+ * 该账号没有此窗口的积分桶时返回 null。 */
+export function pointWindowPercent(
+  quota: QuotaInfo | undefined,
+  period: "5h" | "weekly" | "monthly"
+): number | null {
+  for (const item of quota?.balances ?? []) {
+    if (item.unit_type !== "point" || item.period !== period) continue;
+    const total = Number.isFinite(item.total_units) ? item.total_units : 0;
+    if (total <= 0) return 0;
+    const remaining = balanceRemaining(item);
+    return Math.min(100, Math.max(0, (remaining / total) * 100));
+  }
+  return null;
+}
+
+export interface ResetCardDecision {
+  type: ResetCardType;
+}
+
+/**
+ * 是否应该使用重置卡、用哪张。纯规则（阈值可配，百分比按窗口总量计）：
+ *
+ * 1. 触发：5 小时或周窗口任一剩余百分比 ≤ triggerPercent（默认 1）。
+ *    赶在窗口打尽之前用卡，避免请求被拒中断业务；两个窗口都健康时
+ *    绝不动卡（不浪费）。
+ * 2. 排除：月积分窗口存在且同样见底时不用卡——重置卡只回满 5 小时与
+ *    周窗口，月窗口打尽时用卡救不回来，留给常规切换/人工处理。
+ * 3. 选卡：周余额 ≤ weeklyPercent（默认 5）或账号根本没有健康的周窗口
+ *    量纲 → 用周卡（同时回满 5 小时，官方语义）；周窗口充足只是 5 小时
+ *    见底 → 用 5 小时卡（把"两层用"的周卡留给真正需要的时候）。
+ * 4. 没有任何积分窗口数据（未订阅/数据缺失）→ 不触发。
+ */
+export function decideResetCard(
+  quota: QuotaInfo | undefined,
+  triggerPercent: number,
+  weeklyPercent: number
+): ResetCardDecision | null {
+  const p5 = pointWindowPercent(quota, "5h");
+  const pw = pointWindowPercent(quota, "weekly");
+  const pm = pointWindowPercent(quota, "monthly");
+  if (p5 === null && pw === null) return null;
+  // 月窗口见底：重置卡无能为力。
+  if (pm !== null && pm <= triggerPercent) return null;
+  const windows = [p5, pw].filter((v): v is number => v !== null);
+  if (Math.min(...windows) > triggerPercent) return null;
+  if (pw !== null && pw <= weeklyPercent) return { type: "WEEK" };
+  return { type: "FIVE_HOUR" };
 }
 
 // ---------------------------------------------------------------------------

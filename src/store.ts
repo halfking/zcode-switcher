@@ -9,9 +9,12 @@ import {
   type ProfileView,
   type ProxyStatus,
   type QuotaInfo,
+  type ResetCardInventoryView,
+  type ResetCardType,
 } from "./lib/api";
 import {
   accountHeadroom,
+  decideResetCard,
   glm52Remaining,
   isSwitchableCandidate,
 } from "./lib/glm52";
@@ -113,6 +116,21 @@ interface AppState {
    */
   glm52ExhaustRestartZcode: boolean;
   /**
+   * 自动使用重置卡：积分窗口剩余百分比进入触发线（默认 ≤1%）时，
+   * 先用一张重置卡把窗口回满，避免窗口打尽中断业务；周余额低于周阈值
+   * （默认 5%）或用尽时用周卡（同时回满 5 小时窗口），否则用 5 小时卡。
+   * 默认关闭：重置卡是有价值的资产，需用户显式开启。
+   */
+  glm52AutoResetCardEnabled: boolean;
+  /** 重置卡触发阈值（%）：5h/周窗口剩余 ≤ 此值才用卡。 */
+  glm52ResetCardTriggerPercent: number;
+  /** 周卡判定阈值（%）：周窗口剩余 ≤ 此值（或用尽）选周卡，否则 5h 卡。 */
+  glm52ResetCardWeeklyPercent: number;
+  /** 当前账号的重置卡库存（设置面板展示用；null=未加载）。 */
+  resetCardInventory: ResetCardInventoryView | null;
+  resetCardLoading: boolean;
+  resetCardError: string | null;
+  /**
    * 无可切换账号时的自动暂停标记（会话内状态，不持久化）：
    * 暂停期间不做任何切换尝试（监测回落到慢速档），防止在低额度
    * 账号之间循环切换；当前账号恢复、出现满足双阈值的候选账号或
@@ -174,6 +192,13 @@ interface AppState {
   setGlm52AutoSwitchPointThreshold: (v: number) => void;
   setGlm52LowQuotaAction: (v: LowQuotaAction) => void;
   setGlm52ExhaustRestartZcode: (v: boolean) => void;
+  setGlm52AutoResetCardEnabled: (v: boolean) => void;
+  setGlm52ResetCardTriggerPercent: (v: number) => void;
+  setGlm52ResetCardWeeklyPercent: (v: number) => void;
+  /** 拉取当前（或指定）账号的重置卡库存（只读）。 */
+  refreshResetCardInventory: (id?: string) => Promise<void>;
+  /** 手动使用一张重置卡（当前账号），成功后刷新库存与额度。 */
+  useResetCard: (resetType: ResetCardType) => Promise<boolean>;
   setAutoSwitchPaused: (v: boolean) => void;
   setSwitchVerifyProgress: (p: SwitchVerifyProgress | null) => void;
   setAutoRestart: (v: boolean) => void;
@@ -219,6 +244,10 @@ let lastPlanSwitchAttemptAt = 0;
 let lastPlanSwitchFailed = false;
 // 暂停模式的提示只发一次；额度恢复或人工处理后再置位。
 let guardPauseNotified = false;
+// 重置卡自动使用的失败冷却：库存为空/接口失败后 10 分钟内不再尝试，
+// 避免每轮刷新（最快 5 秒一档）都打库存/使用接口。
+let lastResetCardFailureAt = 0;
+const RESET_CARD_RETRY_COOLDOWN_MS = 10 * 60_000;
 
 let refreshAllInFlight = false;
 
@@ -367,6 +396,54 @@ function loadGlm52ExhaustRestartZcode(): boolean {
     return localStorage.getItem("zcs:glm52ExhaustRestartZcode") !== "0";
   } catch {
     return true;
+  }
+}
+// 重置卡阈值（百分比）。触发阈值默认 1%：赶在窗口打尽前用卡；周卡判定
+// 阈值默认 5%：周余额低于此值（或用尽）就该用"两层用"的周卡。
+const GLM52_RESET_CARD_TRIGGER_MIN = 0.1;
+const GLM52_RESET_CARD_TRIGGER_MAX = 20;
+const GLM52_DEFAULT_RESET_CARD_TRIGGER = 1;
+const GLM52_RESET_CARD_WEEKLY_MIN = 1;
+const GLM52_RESET_CARD_WEEKLY_MAX = 50;
+const GLM52_DEFAULT_RESET_CARD_WEEKLY = 5;
+function loadGlm52AutoResetCardEnabled(): boolean {
+  try {
+    return localStorage.getItem("zcs:glm52AutoResetCardEnabled") === "1";
+  } catch {
+    return false;
+  }
+}
+function clampResetCardTriggerPercent(n: number): number {
+  // Number(null)===0：localStorage 无值时不能把 0 当合法输入钳到最小值。
+  if (!Number.isFinite(n) || n <= 0) return GLM52_DEFAULT_RESET_CARD_TRIGGER;
+  return Math.max(
+    GLM52_RESET_CARD_TRIGGER_MIN,
+    Math.min(GLM52_RESET_CARD_TRIGGER_MAX, Math.round(n * 10) / 10)
+  );
+}
+function loadGlm52ResetCardTriggerPercent(): number {
+  try {
+    return clampResetCardTriggerPercent(
+      Number(localStorage.getItem("zcs:glm52ResetCardTriggerPercent"))
+    );
+  } catch {
+    return GLM52_DEFAULT_RESET_CARD_TRIGGER;
+  }
+}
+function clampResetCardWeeklyPercent(n: number): number {
+  if (!Number.isFinite(n) || n <= 0) return GLM52_DEFAULT_RESET_CARD_WEEKLY;
+  return Math.max(
+    GLM52_RESET_CARD_WEEKLY_MIN,
+    Math.min(GLM52_RESET_CARD_WEEKLY_MAX, Math.round(n))
+  );
+}
+function loadGlm52ResetCardWeeklyPercent(): number {
+  try {
+    return clampResetCardWeeklyPercent(
+      Number(localStorage.getItem("zcs:glm52ResetCardWeeklyPercent"))
+    );
+  } catch {
+    return GLM52_DEFAULT_RESET_CARD_WEEKLY;
   }
 }
 function loadTheme(): Theme {
@@ -619,6 +696,74 @@ async function maybeSwitchGlm52Account(getStore: () => AppState) {
     void api.setQuotaGuard(false, "").catch(() => {});
   }
 
+  // 第 0 步：重置卡（需开启，默认关）。积分窗口剩余百分比进入触发线
+  // （默认 ≤1%）时先用卡把窗口回满——当前账号原地恢复可用，优于切
+  // 套餐/切账号，也赶在窗口真正打尽、请求被拒中断业务之前。选卡规则
+  // 见 decideResetCard（周余额 ≤5% 或用尽 → 周卡，否则 5 小时卡）。
+  // 只在"现在就影响可用性"时动卡：本轮已判定低额度，或当前入口就是
+  // 积分制；入口健康（如正用 token 且充足）时不为没在消耗的窗口浪费卡。
+  if (
+    state.glm52AutoResetCardEnabled &&
+    Date.now() - lastResetCardFailureAt >= RESET_CARD_RETRY_COOLDOWN_MS
+  ) {
+    const affectsNow =
+      currentLow || currentPlanEntry(activeQuota.active_provider) === "coding-plan";
+    const decision = affectsNow
+      ? decideResetCard(
+          activeQuota,
+          state.glm52ResetCardTriggerPercent,
+          state.glm52ResetCardWeeklyPercent
+        )
+      : null;
+    if (decision) {
+      glm52AutoSwitching = true;
+      let used = false;
+      try {
+        // 用前实时核对库存（只读列表接口）：没有该类型的卡就不打 use，
+        // 记一次失败冷却后走常规切换；不静默换用另一类卡（周卡"两层用"
+        // 更宝贵，5h 卡救不了周窗口打尽）。
+        const inventory = await api.resetCardInventory(active.id).catch(() => null);
+        const pool = inventory
+          ? decision.type === "WEEK"
+            ? inventory.week
+            : inventory.five_hour
+          : [];
+        if (pool.some((card) => card.available)) {
+          if (getStore().busy) return; // 用户手动操作中：不抢动作
+          await api.useResetCard(active.id, decision.type);
+          used = true;
+          state.toast(
+            t.resetCardUsed.replace(
+              "{card}",
+              decision.type === "WEEK" ? t.resetCardWeek : t.resetCardFiveHour
+            ),
+            "success"
+          );
+          // 回满后立即刷新当前账号；下一轮判定看到的就是新窗口。
+          await state.refreshQuota(active.id);
+          // 若处于耗尽暂停：窗口已回满，立刻恢复服务，不等下一轮。
+          if (getStore().autoSwitchPaused) {
+            getStore().setAutoSwitchPaused(false);
+            guardPauseNotified = false;
+            void api.setQuotaGuard(false, "").catch(() => {});
+          }
+        } else {
+          lastResetCardFailureAt = Date.now();
+        }
+      } catch (e) {
+        lastResetCardFailureAt = Date.now();
+        state.toast(
+          t.resetCardUseFailed.replace("{error}", String(e)),
+          "error"
+        );
+      } finally {
+        glm52AutoSwitching = false;
+      }
+      if (used) return;
+      // 未用成（无卡/失败）：落到下面的常规切换判定。
+    }
+  }
+
   // 当前入口余额充足（或入口未知且整帐号判定未触发）→ 无需动作。
   if (!currentLow) {
     if (state.autoSwitchPaused) {
@@ -851,6 +996,12 @@ export const useStore = create<AppState>((set, get) => {
     glm52AutoSwitchPointThreshold: loadGlm52AutoSwitchPointThreshold(),
     glm52LowQuotaAction: loadGlm52LowQuotaAction(),
     glm52ExhaustRestartZcode: loadGlm52ExhaustRestartZcode(),
+    glm52AutoResetCardEnabled: loadGlm52AutoResetCardEnabled(),
+    glm52ResetCardTriggerPercent: loadGlm52ResetCardTriggerPercent(),
+    glm52ResetCardWeeklyPercent: loadGlm52ResetCardWeeklyPercent(),
+    resetCardInventory: null,
+    resetCardLoading: false,
+    resetCardError: null,
     autoSwitchPaused: false,
     switchVerifyProgress: null,
     candidateVerifyConcurrency: DEFAULT_VERIFY_CONCURRENCY,
@@ -1253,6 +1404,76 @@ export const useStore = create<AppState>((set, get) => {
       /* ignore */
     }
     set({ glm52ExhaustRestartZcode: v });
+  },
+
+  setGlm52AutoResetCardEnabled: (v) => {
+    try {
+      localStorage.setItem("zcs:glm52AutoResetCardEnabled", v ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+    set({ glm52AutoResetCardEnabled: v });
+  },
+
+  setGlm52ResetCardTriggerPercent: (v) => {
+    const pct = clampResetCardTriggerPercent(v);
+    try {
+      localStorage.setItem("zcs:glm52ResetCardTriggerPercent", String(pct));
+    } catch {
+      /* ignore */
+    }
+    set({ glm52ResetCardTriggerPercent: pct });
+  },
+
+  setGlm52ResetCardWeeklyPercent: (v) => {
+    const pct = clampResetCardWeeklyPercent(v);
+    try {
+      localStorage.setItem("zcs:glm52ResetCardWeeklyPercent", String(pct));
+    } catch {
+      /* ignore */
+    }
+    set({ glm52ResetCardWeeklyPercent: pct });
+  },
+
+  refreshResetCardInventory: async (id) => {
+    const target = id ?? get().profiles.find((p) => p.active)?.id ?? null;
+    set({ resetCardLoading: true });
+    try {
+      const inventory = await api.resetCardInventory(target ?? undefined);
+      set({ resetCardInventory: inventory, resetCardError: null });
+    } catch (e) {
+      set({ resetCardInventory: null, resetCardError: String(e) });
+    } finally {
+      set({ resetCardLoading: false });
+    }
+  },
+
+  useResetCard: async (resetType) => {
+    const active = get().profiles.find((p) => p.active);
+    set({ busy: true });
+    try {
+      await api.useResetCard(active?.id ?? null, resetType);
+      const t = getTexts(get().language);
+      get().toast(
+        t.resetCardUsed.replace(
+          "{card}",
+          resetType === "WEEK" ? t.resetCardWeek : t.resetCardFiveHour
+        ),
+        "success"
+      );
+      // 库存与当前账号额度都刷新，界面立刻反映新窗口。
+      void get().refreshResetCardInventory(active?.id);
+      if (active) await get().refreshQuota(active.id);
+      return true;
+    } catch (e) {
+      get().toast(
+        getTexts(get().language).resetCardUseFailed.replace("{error}", String(e)),
+        "error"
+      );
+      return false;
+    } finally {
+      set({ busy: false });
+    }
   },
 
   setGlm52AutoSwitchThresholdWan: (v) => {

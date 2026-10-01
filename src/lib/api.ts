@@ -142,6 +142,24 @@ export interface AccountPoolEntryView {
   updated_at: number;
 }
 
+/** 重置卡类型：FIVE_HOUR 只回满 5 小时窗口；WEEK 同时回满周与 5 小时窗口。 */
+export type ResetCardType = "FIVE_HOUR" | "WEEK";
+
+/** 一张重置卡（官网控制台 customer-package-reset 同源）。 */
+export interface ResetCardRecordView {
+  record_id: number;
+  /** 过期时间（"YYYY-MM-DD HH:mm:ss"） */
+  expire_time: string;
+  grant_type: string;
+  available: boolean;
+}
+
+/** 一个账号的重置卡库存（按类型分组，已按过期时间升序）。 */
+export interface ResetCardInventoryView {
+  five_hour: ResetCardRecordView[];
+  week: ResetCardRecordView[];
+}
+
 /** 调用后端命令，错误会被 reject 成字符串。 */
 export async function cmd<T>(name: string, args?: Record<string, unknown>): Promise<T> {
   return invoke<T>(name, args);
@@ -232,6 +250,12 @@ export const api = {
   deleteCustomProvider: (id: string) =>
     cmd<boolean>("delete_custom_provider", { id }),
   listAccountPool: () => cmd<AccountPoolEntryView[]>("list_account_pool"),
+  /** 查询某档案的重置卡库存（只读）；id 为空查当前登录账号。 */
+  resetCardInventory: (id?: string) =>
+    cmd<ResetCardInventoryView>("reset_card_inventory", { id: id ?? null }),
+  /** 使用一张指定类型的重置卡（同类里最先过期的先用）。 */
+  useResetCard: (id: string | null, resetType: ResetCardType) =>
+    cmd<ResetCardRecordView>("use_reset_card_cmd", { id, resetType }),
   addAccountToPool: (profileId: string) =>
     cmd<AccountPoolEntryView>("add_account_to_pool", { profileId }),
   setAccountPoolEnabled: (profileId: string, enabled: boolean) =>

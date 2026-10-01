@@ -18,9 +18,9 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type DownloadEvent } from "@tauri-apps/plugin-updater";
 import { useStore, type Theme } from "../store";
-import { api } from "../lib/api";
+import { api, type ResetCardType } from "../lib/api";
 import { formatText, getTexts, type Language } from "../i18n";
-import { UpdateModal } from "./Modal";
+import { ConfirmModal, UpdateModal } from "./Modal";
 
 const PROJECT_HOMEPAGE_URL = "https://github.com/halfking/zcode-switcher";
 
@@ -371,6 +371,17 @@ export default function SettingsPanel() {
     setGlm52LowQuotaAction,
     glm52ExhaustRestartZcode,
     setGlm52ExhaustRestartZcode,
+    glm52AutoResetCardEnabled,
+    setGlm52AutoResetCardEnabled,
+    glm52ResetCardTriggerPercent,
+    setGlm52ResetCardTriggerPercent,
+    glm52ResetCardWeeklyPercent,
+    setGlm52ResetCardWeeklyPercent,
+    resetCardInventory,
+    resetCardLoading,
+    resetCardError,
+    refreshResetCardInventory,
+    useResetCard,
     autoRestart,
     setAutoRestart,
     tryNoRestartSwitch,
@@ -388,6 +399,8 @@ export default function SettingsPanel() {
 
   const [version, setVersion] = useState("v 1.1.6");
   const [checkingUpdate, setCheckingUpdate] = useState(false);
+  // 待确认的手动用卡类型（弹 ConfirmModal）。
+  const [resetCardConfirm, setResetCardConfirm] = useState<ResetCardType | null>(null);
   const [updateModal, setUpdateModal] = useState<
     | {
         title: string;
@@ -406,6 +419,11 @@ export default function SettingsPanel() {
       .then((appVersion) => setVersion(`v${appVersion}`))
       .catch(() => {});
   }, []);
+
+  // 打开设置面板时拉一次当前账号的重置卡库存（只读）。
+  useEffect(() => {
+    refreshResetCardInventory();
+  }, [refreshResetCardInventory]);
 
   const handleCheckUpdate = async () => {
     if (checkingUpdate) return;
@@ -633,6 +651,111 @@ export default function SettingsPanel() {
       </Row>
 
       <Row
+        icon={<Zap size={15} />}
+        title={t.resetCardTitle}
+        desc={t.resetCardDesc}
+      >
+        <Toggle
+          on={glm52AutoResetCardEnabled}
+          onClick={() => setGlm52AutoResetCardEnabled(!glm52AutoResetCardEnabled)}
+        />
+      </Row>
+
+      <Row
+        icon={<Clock size={15} />}
+        title={t.resetCardTriggerTitle}
+        desc={t.resetCardTriggerDesc}
+      >
+        <div className="flex items-center gap-2">
+          <input
+            type="number"
+            min={0.1}
+            max={20}
+            step={0.1}
+            value={glm52ResetCardTriggerPercent}
+            onChange={(e) =>
+              setGlm52ResetCardTriggerPercent(Number(e.currentTarget.value))
+            }
+            disabled={!glm52AutoResetCardEnabled}
+            className="focus-ring h-8 w-20 rounded-lg border border-base-border bg-base-card px-2 text-right text-sm font-semibold text-text-primary outline-none transition hover:bg-base-cardhover disabled:opacity-50"
+          />
+          <span className="text-xs font-medium text-text-muted">{t.percentUnit}</span>
+        </div>
+      </Row>
+
+      <Row
+        icon={<Clock size={15} />}
+        title={t.resetCardWeeklyTitle}
+        desc={t.resetCardWeeklyDesc}
+      >
+        <div className="flex items-center gap-2">
+          <input
+            type="number"
+            min={1}
+            max={50}
+            step={1}
+            value={glm52ResetCardWeeklyPercent}
+            onChange={(e) =>
+              setGlm52ResetCardWeeklyPercent(Number(e.currentTarget.value))
+            }
+            disabled={!glm52AutoResetCardEnabled}
+            className="focus-ring h-8 w-20 rounded-lg border border-base-border bg-base-card px-2 text-right text-sm font-semibold text-text-primary outline-none transition hover:bg-base-cardhover disabled:opacity-50"
+          />
+          <span className="text-xs font-medium text-text-muted">{t.percentUnit}</span>
+        </div>
+      </Row>
+
+      <Row
+        icon={<Zap size={15} />}
+        title={t.resetCardInventoryTitle}
+        desc={
+          resetCardError
+            ? formatText(t.resetCardLoadFailed, { error: resetCardError })
+            : resetCardInventory &&
+              (resetCardInventory.five_hour.some((card) => card.available) ||
+                resetCardInventory.week.some((card) => card.available))
+            ? formatText(t.resetCardInventoryLine, {
+                five:
+                  resetCardInventory.five_hour.filter((card) => card.available)
+                    .length,
+                week: resetCardInventory.week.filter((card) => card.available)
+                  .length,
+              })
+            : t.resetCardInventoryEmpty
+        }
+      >
+        <div className="flex shrink-0 items-center gap-1.5">
+          <button
+            onClick={() => refreshResetCardInventory()}
+            disabled={resetCardLoading}
+            className="focus-ring h-8 rounded-lg border border-base-border bg-base-card px-2 text-xs font-semibold text-text-secondary transition hover:bg-base-cardhover hover:text-text-primary active:scale-[0.96] disabled:opacity-50"
+          >
+            {resetCardLoading ? "…" : t.resetCardRefresh}
+          </button>
+          <button
+            onClick={() => setResetCardConfirm("FIVE_HOUR")}
+            disabled={
+              resetCardLoading ||
+              !resetCardInventory?.five_hour.some((card) => card.available)
+            }
+            className="focus-ring h-8 rounded-lg border border-base-border bg-base-card px-2 text-xs font-semibold text-text-secondary transition hover:bg-base-cardhover hover:text-text-primary active:scale-[0.96] disabled:opacity-50"
+          >
+            {t.resetCardUseFive}
+          </button>
+          <button
+            onClick={() => setResetCardConfirm("WEEK")}
+            disabled={
+              resetCardLoading ||
+              !resetCardInventory?.week.some((card) => card.available)
+            }
+            className="focus-ring h-8 rounded-lg border border-base-border bg-base-card px-2 text-xs font-semibold text-text-secondary transition hover:bg-base-cardhover hover:text-text-primary active:scale-[0.96] disabled:opacity-50"
+          >
+            {t.resetCardUseWeek}
+          </button>
+        </div>
+      </Row>
+
+      <Row
         icon={<Clock size={15} />}
         title={t.activeRefreshTitle}
         desc={glm52AutoSwitchEnabled ? t.activeRefreshDescAuto : t.activeRefreshDesc}
@@ -747,6 +870,25 @@ export default function SettingsPanel() {
           language={language}
           onYes={() => updateModal.resolve?.(true)}
           onClose={() => updateModal.resolve?.(false)}
+        />
+      )}
+
+      {resetCardConfirm && (
+        <ConfirmModal
+          title={t.resetCardConfirmTitle}
+          message={
+            resetCardConfirm === "WEEK"
+              ? t.resetCardConfirmWeek
+              : t.resetCardConfirmFive
+          }
+          confirmText={t.resetCardConfirmTitle}
+          language={language}
+          onYes={async () => {
+            const type = resetCardConfirm;
+            setResetCardConfirm(null);
+            await useResetCard(type);
+          }}
+          onClose={() => setResetCardConfirm(null)}
         />
       )}
 

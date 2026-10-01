@@ -8,6 +8,7 @@ mod profile;
 mod proxy;
 mod proxy_pool;
 mod quota;
+mod reset_card;
 mod restart;
 mod tray;
 mod zcode_cdp;
@@ -715,6 +716,8 @@ pub fn run() {
             profile::open_config_dir,
             profile::fetch_quota,
             profile::switch_plan,
+            reset_card::reset_card_inventory,
+            reset_card::use_reset_card_cmd,
             custom_provider::list_custom_providers,
             custom_provider::add_custom_provider,
             custom_provider::update_custom_provider,
