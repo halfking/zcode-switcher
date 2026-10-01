@@ -31,6 +31,11 @@ pub struct BalanceItem {
     /// "personal:glm-coding"）。前端据此把条目归组到 plans[] 里的套餐。
     #[serde(default)]
     pub plan_id: Option<String>,
+    /// 该桶的重置时刻（Unix 秒；quota/limit 的 nextResetTime 毫秒换算而来，
+    /// billing / mcp-usage 源不提供时为 None）。前端据此在 5 小时/周窗口
+    /// 到点时自动刷新额度，让卡片与耗尽状态随窗口翻转复位。
+    #[serde(default)]
+    pub next_reset_at: Option<f64>,
 }
 
 /// 账号名下的一个套餐摘要（plans[] 条目，前端按此分组展示余额）。
@@ -518,6 +523,13 @@ fn parse_coding_plan_usage(value: &Value) -> Option<CodingPlanSnapshot> {
             limit.get("unit").and_then(Value::as_i64).unwrap_or(0),
             limit.get("number").and_then(Value::as_i64).unwrap_or(0),
         );
+        // nextResetTime 是毫秒时间戳；缺失/非法时留 None（前端只做倒计时
+        // 展示与到点刷新，None 条目退回周期轮询）。
+        let next_reset_at = limit
+            .get("nextResetTime")
+            .and_then(Value::as_f64)
+            .filter(|ms| ms.is_finite() && *ms > 0.0)
+            .map(|ms| ms / 1000.0);
         let is_credit = limit_type == "CREDIT_LIMIT";
         items.push(BalanceItem {
             show_name: if is_credit {
@@ -531,6 +543,7 @@ fn parse_coding_plan_usage(value: &Value) -> Option<CodingPlanSnapshot> {
             unit_type: Some(if is_credit { "point".into() } else { "tool".into() }),
             period: window_period(unit, number),
             plan_id: None,
+            next_reset_at,
         });
     }
     if items.is_empty() {
@@ -667,6 +680,8 @@ fn parse_mcp_usage(value: &Value) -> Option<CodingPlanSnapshot> {
             unit_type: Some("point".into()),
             period: None,
             plan_id: None,
+            // mcp/usage 汇总不区分窗口，也没有重置时刻可报。
+            next_reset_at: None,
         }],
     })
 }
@@ -1336,6 +1351,7 @@ mod tests {
         assert_eq!(credits.remaining_units, 25434.0);
         assert_eq!(credits.unit_type.as_deref(), Some("point"));
         assert_eq!(credits.period.as_deref(), Some("5h"));
+        assert_eq!(credits.next_reset_at, Some(1789522664420.0 / 1000.0));
 
         // 每周窗口的"周积分"桶
         let weekly = &snapshot.items[1];
@@ -1343,12 +1359,14 @@ mod tests {
         assert_eq!(weekly.total_units, 140000.0);
         assert_eq!(weekly.remaining_units, 66453.0);
         assert_eq!(weekly.period.as_deref(), Some("weekly"));
+        assert_eq!(weekly.next_reset_at, Some(1789808998979.0 / 1000.0));
 
         // 每月窗口的"月积分"桶
         let monthly = &snapshot.items[2];
         assert_eq!(monthly.show_name, "月积分");
         assert_eq!(monthly.remaining_units, 4800.0);
         assert_eq!(monthly.period.as_deref(), Some("monthly"));
+        assert_eq!(monthly.next_reset_at, Some(1790007765994.0 / 1000.0));
 
         // TIME_LIMIT 是 MCP 工具调用额度（次），仅展示、不参与积分阈值
         let tool = &snapshot.items[3];
@@ -1356,6 +1374,7 @@ mod tests {
         assert_eq!(tool.remaining_units, 3246.0);
         assert_eq!(tool.unit_type.as_deref(), Some("tool"));
         assert_eq!(tool.period.as_deref(), Some("monthly"));
+        assert_eq!(tool.next_reset_at, Some(1790256740998.0 / 1000.0));
 
         // TOKENS_LIMIT（仅百分比、无绝对值）不产出条目
         assert!(snapshot
@@ -1405,6 +1424,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_coding_plan_usage_next_reset_time_tolerates_missing_and_bad() {
+        // nextResetTime 缺失 / 非数字 / 非正数：只影响该桶的重置时刻
+        // （None），不能让整条目或整快照解析失败。
+        let value: Value = serde_json::from_str(
+            r#"{"code":200,"success":true,"data":{"limits":[
+                {"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":28000,"currentValue":2566,"remaining":25434},
+                {"type":"CREDIT_LIMIT","unit":6,"number":1,"usage":140000,"currentValue":1,"remaining":139999,"nextResetTime":"soon"},
+                {"type":"TIME_LIMIT","unit":6,"number":1,"usage":100,"currentValue":1,"remaining":99,"nextResetTime":0}
+            ],"level":"lite"}}"#,
+        )
+        .unwrap();
+        let snapshot = parse_coding_plan_usage(&value).expect("应解析成功");
+        assert_eq!(snapshot.items.len(), 3);
+        assert_eq!(snapshot.items[0].next_reset_at, None);
+        assert_eq!(snapshot.items[1].next_reset_at, None);
+        assert_eq!(snapshot.items[2].next_reset_at, None);
+    }
+
+    #[test]
     fn parse_coding_plan_usage_rejects_errors_and_empty() {
         // 未订阅 / 无效凭据：code != 200
         let denied: Value =
@@ -1445,6 +1483,12 @@ mod tests {
             info.plan_status,
             info.balances.len()
         );
+        for item in &info.balances {
+            println!(
+                "  {} period={:?} next_reset_at={:?}",
+                item.show_name, item.period, item.next_reset_at
+            );
+        }
         assert!(!info.balances.is_empty(), "balances 不应为空");
     }
 }

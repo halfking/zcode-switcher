@@ -1,6 +1,6 @@
 {
   "name": "zcode-switcher",
-  "version": "1.1.17+48",
+  "version": "1.1.18+49",
   "private": true,
   "type": "module",
   "scripts": {
@@ -15,7 +15,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "test:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-regression.ps1",
-    "test:autoswitch": "node scripts/auto-switch-regression.mjs"
+    "test:autoswitch": "node scripts/auto-switch-regression.mjs",
+    "test:windowreset": "node scripts/window-reset-regression.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

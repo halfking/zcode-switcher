@@ -34,6 +34,9 @@ export interface BalanceItem {
   period: string | null;
   /** 条目所属套餐的 plan_id（个人套餐积分组为 "personal:glm-coding"）。 */
   plan_id?: string | null;
+  /** 该额度桶的重置时刻（Unix 秒；quota/limit 源的 nextResetTime 换算，
+   *  billing / mcp-usage 源不提供为 null）。窗口到点时前端自动刷新额度。 */
+  next_reset_at?: number | null;
 }
 
 /** 账号名下的一个套餐摘要（QuotaInfo.plans 条目，用于分组展示）。 */

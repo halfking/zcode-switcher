@@ -41,6 +41,11 @@ const zh = {
   quotaInUse: "使用中",
   quotaCurrentPlan: "当前套餐",
   quotaRefreshOk: "刷新成功",
+  quotaResetIn: "{time} 后重置",
+  windowCardsLabel: "重置窗口：",
+  windowCard5h: "5小时卡 ×{count}",
+  windowCardWeekly: "周卡 ×{count}",
+  windowCardMonthly: "月卡 ×{count}",
   refreshQuota: "刷新额度",
   exportJson: "导出 JSON",
   switchAccount: "切换账号",
@@ -378,6 +383,11 @@ const en: Texts = {
   quotaInUse: "In use",
   quotaCurrentPlan: "Current plan",
   quotaRefreshOk: "Refreshed",
+  quotaResetIn: "resets in {time}",
+  windowCardsLabel: "Reset windows: ",
+  windowCard5h: "5h cards ×{count}",
+  windowCardWeekly: "weekly cards ×{count}",
+  windowCardMonthly: "monthly cards ×{count}",
   refreshQuota: "Refresh quota",
   exportJson: "Export JSON",
   switchAccount: "Switch account",
@@ -714,6 +724,11 @@ const ru: Texts = {
   quotaInUse: "Используется",
   quotaCurrentPlan: "Текущий план",
   quotaRefreshOk: "Обновлено",
+  quotaResetIn: "сброс через {time}",
+  windowCardsLabel: "Окна сброса: ",
+  windowCard5h: "5-часовых ×{count}",
+  windowCardWeekly: "недельных ×{count}",
+  windowCardMonthly: "месячных ×{count}",
   refreshQuota: "Обновить квоту",
   exportJson: "Экспорт JSON",
   switchAccount: "Сменить аккаунт",
@@ -1029,4 +1044,19 @@ export function formatText(
     const value = values[key];
     return value === null || value === undefined ? "" : String(value);
   });
+}
+
+/** 组装"重置窗口：5小时卡 ×2 · 周卡 ×2"统计行；没有任何积分卡时返回空串。 */
+export function composeWindowCardsLine(
+  t: Texts,
+  counts: { fiveHour: number; weekly: number; monthly: number }
+): string {
+  const parts: string[] = [];
+  if (counts.fiveHour > 0)
+    parts.push(formatText(t.windowCard5h, { count: counts.fiveHour }));
+  if (counts.weekly > 0)
+    parts.push(formatText(t.windowCardWeekly, { count: counts.weekly }));
+  if (counts.monthly > 0)
+    parts.push(formatText(t.windowCardMonthly, { count: counts.monthly }));
+  return parts.length > 0 ? `${t.windowCardsLabel}${parts.join(" · ")}` : "";
 }

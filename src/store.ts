@@ -164,6 +164,8 @@ interface AppState {
   /** 定时触发的批量刷新 */
   scheduledRefreshAllQuota: (orderedIds?: string[]) => Promise<void>;
   refreshActiveQuotaForAutoSwitch: () => Promise<void>;
+  /** 重置窗口到点触发的刷新：刷新指定账号后重评自动切换（解除耗尽暂停）。 */
+  refreshQuotaForWindowReset: (ids: string[]) => Promise<void>;
   setAutoRefreshQuota: (v: boolean) => void;
   setQuotaRefreshIntervalMinutes: (v: number) => void;
   setActiveQuotaRefreshIntervalMinutes: (v: number) => void;
@@ -1167,6 +1169,18 @@ export const useStore = create<AppState>((set, get) => {
     const active = get().profiles.find((p) => p.active);
     if (!active) return;
     await get().refreshQuota(active.id);
+    await maybeSwitchGlm52Account(get);
+  },
+
+  refreshQuotaForWindowReset: async (ids) => {
+    // 5 小时/周窗口到点：刷新过点账号，让卡片剩余额与耗尽状态复位。
+    // 刷新后必须重评自动切换 —— 被重置的可能是非当前账号，普通
+    // refreshQuota 不会触发评估，耗尽暂停会一直挂到下轮批量刷新。
+    for (const id of ids) {
+      const exists = get().profiles.some((p) => p.id === id);
+      if (!exists) continue;
+      await get().refreshQuota(id);
+    }
     await maybeSwitchGlm52Account(get);
   },
 

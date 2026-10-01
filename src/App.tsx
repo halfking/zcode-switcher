@@ -20,9 +20,14 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { check as checkUpdate } from "@tauri-apps/plugin-updater";
 import { useStore } from "./store";
 import { api, type CurrentStatus } from "./lib/api";
-import { dynamicQuotaRefreshIntervalMs } from "./lib/glm52";
+import {
+  countWindowCards,
+  dueWindowResetProfileIds,
+  dynamicQuotaRefreshIntervalMs,
+  pendingWindowResets,
+} from "./lib/glm52";
 import { LogicalSize, getCurrentWindow } from "@tauri-apps/api/window";
-import { LANGUAGES, formatText, getTexts } from "./i18n";
+import { LANGUAGES, composeWindowCardsLine, formatText, getTexts } from "./i18n";
 import zcodeLogo from "./assets/zcode-logo.png";
 import AccountCard from "./components/AccountCard";
 import EmptyState from "./components/EmptyState";
@@ -78,6 +83,10 @@ const NORMAL_WINDOW_HEIGHT = 780;
 // 临时下线：API Key 导入供应商与本地 API 服务是两套不相关的能力，
 // 重新开启时需要拆开入口和数据流，不能再把 API Key 上游挂到本地反代里。
 const LOCAL_API_FEATURE_ENABLED = false;
+// 重置窗口到点刷新：过重置时刻 15 秒再刷，留服务端翻转窗口的余量；
+// 同账号两次重置刷新至少间隔 60 秒（上游时间戳异常时防止刷新循环）。
+const WINDOW_RESET_SETTLE_MS = 15_000;
+const WINDOW_RESET_RETRY_MS = 60_000;
 
 export default function App() {
   const {
@@ -106,6 +115,7 @@ export default function App() {
     scheduledRefreshSeq,
     refreshActiveQuotaForAutoSwitch,
     refreshQuota,
+    refreshQuotaForWindowReset,
     captureCurrent,
     switchTo,
     renameProfile,
@@ -317,6 +327,59 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [activeProfile, computeActiveRefreshIntervalMs, refreshActiveQuotaForAutoSwitch]);
 
+  // ---- 5 小时/周窗口到点自动重置 ----
+  // 额度桶自带 next_reset_at（quota/limit 源的 nextResetTime）。到点后定点
+  // 刷新对应账号，卡片剩余额、耗尽徽标与自动切换的暂停状态随窗口翻转复位，
+  // 不必等下一个周期轮询（暂停档最长 60 秒、批量档默认 10 分钟）。
+  const windowResetAttemptAt = useRef(new Map<string, number>());
+
+  const runDueWindowResets = useCallback(() => {
+    const nowMs = Date.now();
+    const due = dueWindowResetProfileIds(
+      useStore.getState().quotas,
+      nowMs,
+      WINDOW_RESET_SETTLE_MS
+    );
+    if (due.length === 0) return;
+    const attempts = windowResetAttemptAt.current;
+    const ids: string[] = [];
+    for (const id of due) {
+      if (nowMs - (attempts.get(id) ?? 0) < WINDOW_RESET_RETRY_MS) continue;
+      attempts.set(id, nowMs);
+      ids.push(id);
+    }
+    if (attempts.size > 64) {
+      for (const [id, at] of attempts) {
+        if (nowMs - at >= WINDOW_RESET_RETRY_MS) attempts.delete(id);
+      }
+    }
+    if (ids.length === 0) return;
+    refreshQuotaForWindowReset(ids).catch(() => {});
+  }, [refreshQuotaForWindowReset]);
+
+  const earliestPendingResetAt = useMemo(() => {
+    const pending = pendingWindowResets(quotas, Date.now() / 1000);
+    return pending.length > 0
+      ? Math.min(...pending.map((p) => p.resetAt))
+      : null;
+  }, [quotas]);
+
+  useEffect(() => {
+    if (earliestPendingResetAt === null) return;
+    const delayMs = Math.max(
+      2_000,
+      earliestPendingResetAt * 1000 + WINDOW_RESET_SETTLE_MS - Date.now()
+    );
+    const timer = window.setTimeout(() => runDueWindowResets(), delayMs);
+    return () => window.clearTimeout(timer);
+  }, [earliestPendingResetAt, runDueWindowResets, quotas]);
+
+  // 兜底扫描：系统休眠唤醒 / 定时器漏触发后，周期性补刷已到期的窗口。
+  useEffect(() => {
+    const timer = window.setInterval(() => runDueWindowResets(), 60_000);
+    return () => window.clearInterval(timer);
+  }, [runDueWindowResets]);
+
   useEffect(() => {
     const refreshIfOverdue = () => {
       if (document.visibilityState === "hidden") return;
@@ -336,11 +399,19 @@ export default function App() {
       refreshActiveQuotaForAutoSwitch();
       activeQuotaRefreshDueAt.current = now + computeActiveRefreshIntervalMs();
     };
+    const refreshWindowResets = () => {
+      if (document.visibilityState === "hidden") return;
+      runDueWindowResets();
+    };
     window.addEventListener("focus", refreshIfOverdue);
     document.addEventListener("visibilitychange", refreshIfOverdue);
+    window.addEventListener("focus", refreshWindowResets);
+    document.addEventListener("visibilitychange", refreshWindowResets);
     return () => {
       window.removeEventListener("focus", refreshIfOverdue);
       document.removeEventListener("visibilitychange", refreshIfOverdue);
+      window.removeEventListener("focus", refreshWindowResets);
+      document.removeEventListener("visibilitychange", refreshWindowResets);
     };
   }, [
     activeProfile,
@@ -349,6 +420,7 @@ export default function App() {
     scheduledRefreshAllQuota,
     sortedProfileIds,
     refreshActiveQuotaForAutoSwitch,
+    runDueWindowResets,
   ]);
 
   // 模式/主题变化（罕见）：重新配置窗口装饰、置顶、背景等。
@@ -755,9 +827,20 @@ export default function App() {
       )}
 
       <div className="flex items-center justify-between gap-3 px-7 py-4">
-        <span className="shrink-0 text-sm font-bold text-text-secondary">
-          {formatText(t.myAccounts, { count: profiles.length })}
-        </span>
+        <div className="flex min-w-0 flex-col">
+          <span className="shrink-0 text-sm font-bold text-text-secondary">
+            {formatText(t.myAccounts, { count: profiles.length })}
+          </span>
+          {/* 重置窗口卡片计数：5 小时/周/月积分卡各几张（无积分卡时隐藏） */}
+          {(() => {
+            const line = composeWindowCardsLine(t, countWindowCards(quotas));
+            return line ? (
+              <span className="truncate text-[10px] text-text-muted" title={line}>
+                {line}
+              </span>
+            ) : null;
+          })()}
+        </div>
         <div className="flex shrink-0 items-center gap-2">
           <SortMenu
             value={accountSortMode}

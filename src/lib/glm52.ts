@@ -191,6 +191,99 @@ export function formatQuotaUnits(n: number): string {
   return Math.round(n).toLocaleString();
 }
 
+// ---------------------------------------------------------------------------
+// 重置窗口（5 小时 / 周 / 月）：卡片计数与到点自动重置的判定辅助。
+// ---------------------------------------------------------------------------
+
+/** 按重置窗口统计的积分卡片数量（5h / 周 / 月各几张）。 */
+export interface WindowCardCounts {
+  fiveHour: number;
+  weekly: number;
+  monthly: number;
+}
+
+/**
+ * 统计账号池里各重置窗口的积分卡片数量（unit_type=point 的额度桶，
+ * 即 5小时积分 / 周积分 / 月积分卡）。token 桶与工具额度不参与计数。
+ */
+export function countWindowCards(quotas: Record<string, QuotaInfo>): WindowCardCounts {
+  const counts = { fiveHour: 0, weekly: 0, monthly: 0 };
+  for (const quota of Object.values(quotas)) {
+    for (const item of quota?.balances ?? []) {
+      if (item.unit_type !== "point") continue;
+      if (item.period === "5h") counts.fiveHour += 1;
+      else if (item.period === "weekly") counts.weekly += 1;
+      else if (item.period === "monthly") counts.monthly += 1;
+    }
+  }
+  return counts;
+}
+
+/** 一个尚未反映到缓存数据的窗口重置（缓存拉取时间早于重置时刻）。 */
+export interface PendingWindowReset {
+  profileId: string;
+  /** 重置时刻（Unix 秒） */
+  resetAt: number;
+}
+
+/**
+ * 找出"到点后需要刷新"的窗口重置：额度桶带 next_reset_at，且缓存数据的
+ * 拉取时间（fetched_at）早于该时刻 —— 说明重置发生时界面还是旧窗口，
+ * 到点后刷新该账号即可让卡片剩余额与耗尽状态自动复位。
+ * fetched_at >= reset_at 的桶：本次拉取已包含重置后的新窗口，无需处理。
+ */
+export function pendingWindowResets(
+  quotas: Record<string, QuotaInfo>,
+  nowSec: number
+): PendingWindowReset[] {
+  const out: PendingWindowReset[] = [];
+  for (const [profileId, quota] of Object.entries(quotas)) {
+    if (!quota || quota.error) continue;
+    const fetchedAt = quota.fetched_at ?? 0;
+    for (const item of quota.balances ?? []) {
+      const resetAt = item.next_reset_at ?? 0;
+      // 已过期很久仍没刷出来（>7 天）多半是上游时间戳异常，交给常规轮询。
+      if (resetAt <= 0 || resetAt < nowSec - 7 * 86400) continue;
+      if (fetchedAt >= resetAt) continue;
+      out.push({ profileId, resetAt });
+    }
+  }
+  return out;
+}
+
+/**
+ * 收集"重置已过点且尚未反映到缓存"的账号 id（去重；同一账号多个桶
+ * 到点只刷新一次）。settleMs 是过点后的等待余量：给服务端翻转窗口
+ * 留时间，避免到点瞬间拉到的还是旧窗口数据。
+ */
+export function dueWindowResetProfileIds(
+  quotas: Record<string, QuotaInfo>,
+  nowMs: number,
+  settleMs: number
+): string[] {
+  const ids = new Set<string>();
+  for (const p of pendingWindowResets(quotas, nowMs / 1000)) {
+    if (p.resetAt * 1000 + settleMs <= nowMs) ids.add(p.profileId);
+  }
+  return [...ids];
+}
+
+/**
+ * 距重置时刻的剩余时长（秒）→ 短文案。只做展示，粒度到分；
+ * 超过 48 小时以"天+小时"表达。expired<=0 返回空串（不展示）。
+ */
+export function formatResetCountdown(secondsLeft: number): string {
+  if (!Number.isFinite(secondsLeft) || secondsLeft <= 0) return "";
+  const totalMin = Math.round(secondsLeft / 60);
+  if (totalMin < 1) return "<1m";
+  const days = Math.floor(totalMin / 1440);
+  const hours = Math.floor((totalMin % 1440) / 60);
+  const minutes = totalMin % 60;
+  if (days > 0) return `${days}d${hours}h`;
+  if (hours > 0) return `${hours}h${minutes}m`;
+  return `${minutes}m`;
+}
+
 // 按剩余额度动态调整监测间隔：越接近切换阈值刷新越快，充裕时放慢轮询。
 // token 与积分取"相对阈值余量"更紧的一端定档；已自动暂停时回到慢速档。
 export const DYNAMIC_REFRESH_MIN_MS = 5_000;

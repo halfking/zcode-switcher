@@ -1,7 +1,7 @@
 import { X, Zap } from "lucide-react";
-import { computeGlm52PoolStats, formatQuotaUnits } from "../lib/glm52";
+import { computeGlm52PoolStats, countWindowCards, formatQuotaUnits } from "../lib/glm52";
 import type { ProfileView, QuotaInfo } from "../lib/api";
-import { getTexts, type Language } from "../i18n";
+import { composeWindowCardsLine, getTexts, type Language } from "../i18n";
 
 interface Props {
   profiles: ProfileView[];
@@ -41,6 +41,8 @@ export default function FloatingCapsule({
     stats.totalUnits > 0
       ? Math.min(100, Math.max(0, (stats.usedUnits / stats.totalUnits) * 100))
       : 0;
+  // 胶囊空间有限：5h/周/月积分卡数量放在账号池数字的 tooltip 里。
+  const windowCardsTitle = composeWindowCardsLine(t, countWindowCards(quotas));
 
   const innerH = FLOATING_BASE_H + (resizerOpen ? FLOATING_RESIZER_EXTRA_H : 0);
 
@@ -80,7 +82,7 @@ export default function FloatingCapsule({
             <Zap size={16} />
           </button>
 
-          <div data-tauri-drag-region className="shrink-0 leading-none">
+          <div className="shrink-0 leading-none" title={windowCardsTitle || undefined}>
             <span
               data-tauri-drag-region
               className="text-xl font-black tabular-nums text-text-primary"

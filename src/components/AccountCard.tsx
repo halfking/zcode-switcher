@@ -269,6 +269,7 @@ function AccountCard({
                         compact
                         active={current}
                         activeLabel={t.quotaCurrentPlan}
+                        language={language}
                       />
                     ))}
                   </div>
@@ -594,6 +595,7 @@ function AccountCard({
                       item={{ ...b, show_name: stripPlanPrefix(b.show_name) }}
                       active={current && isBalanceActive(b, quota?.active_provider)}
                       activeLabel={t.quotaCurrentPlan}
+                      language={language}
                     />
                   ))}
                 </div>

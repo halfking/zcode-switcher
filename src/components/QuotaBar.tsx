@@ -1,4 +1,7 @@
+import { useEffect, useState } from "react";
 import type { BalanceItem } from "../lib/api";
+import { formatResetCountdown } from "../lib/glm52";
+import { formatText, getTexts, type Language } from "../i18n";
 
 interface Props {
   item: BalanceItem;
@@ -8,6 +11,8 @@ interface Props {
   active?: boolean;
   /** "使用中" 文案（title 提示用），由调用方按语言传入。 */
   activeLabel?: string;
+  /** 界面语言（重置倒计时文案）；缺省中文。 */
+  language?: Language;
 }
 
 /** 把数值格式化成易读字符串（万 / 百万 / 亿）。 */
@@ -27,7 +32,25 @@ function colorFor(remainingPct: number): string {
   return "bg-ok";
 }
 
-export function QuotaBar({ item, compact = false, active = false, activeLabel }: Props) {
+/** 倒计时需要随时间推进重渲染；30 秒一跳与"到分"的展示粒度匹配。 */
+function useNowTick(enabled: boolean): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!enabled) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 30_000);
+    return () => window.clearInterval(timer);
+  }, [enabled]);
+  return now;
+}
+
+export function QuotaBar({
+  item,
+  compact = false,
+  active = false,
+  activeLabel,
+  language = "zh",
+}: Props) {
+  const t = getTexts(language);
   const total = item.total_units || 0;
   const used = item.used_units || 0;
   const remaining = item.remaining_units || Math.max(0, total - used);
@@ -36,7 +59,18 @@ export function QuotaBar({ item, compact = false, active = false, activeLabel }:
   const color = colorFor(remainingPct);
   // 积分制套餐（GLM Coding 个人套餐）：单位是积分而非 token，展示时带单位。
   const unit = item.unit_type === "point" ? " 积分" : "";
-  const nameTitle = active && activeLabel ? `${item.show_name}（${activeLabel}）` : item.show_name;
+  // 重置倒计时（next_reset_at 有值才展示；已过期交给到点刷新，不显示）。
+  const resetAtMs = (item.next_reset_at ?? 0) * 1000;
+  const now = useNowTick(resetAtMs > 0);
+  const countdown = resetAtMs > 0 ? formatResetCountdown((resetAtMs - now) / 1000) : "";
+  const resetLabel = countdown
+    ? formatText(t.quotaResetIn, { time: countdown })
+    : "";
+  const nameTitle = resetLabel
+    ? `${item.show_name}${active && activeLabel ? `（${activeLabel}）` : ""}（${resetLabel}）`
+    : active && activeLabel
+    ? `${item.show_name}（${activeLabel}）`
+    : item.show_name;
   // 使用中的条目加左侧绿色边条，与普通条目视觉区分且不挤占窄卡片宽度。
   const activeRing = active ? "border-l-2 border-ok pl-1" : "";
 
@@ -60,6 +94,14 @@ export function QuotaBar({ item, compact = false, active = false, activeLabel }:
           {fmt(remaining)}
           {unit}
         </span>
+        {countdown && (
+          <span
+            className="shrink-0 font-mono text-[9px] leading-none text-text-muted/70"
+            title={resetLabel}
+          >
+            {countdown}
+          </span>
+        )}
       </div>
     );
   }
@@ -79,6 +121,11 @@ export function QuotaBar({ item, compact = false, active = false, activeLabel }:
         {fmt(remaining)}
         {unit} / {fmt(total)}
         {unit}
+        {countdown && (
+          <span className="block text-[9px] font-medium leading-tight text-text-muted/70">
+            {resetLabel}
+          </span>
+        )}
       </span>
     </div>
   );
