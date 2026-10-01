@@ -705,30 +705,47 @@ export default function SettingsPanel() {
         </div>
       </Row>
 
-      <Row
-        icon={<Zap size={15} />}
-        title={t.resetCardInventoryTitle}
-        desc={
-          resetCardError
-            ? formatText(t.resetCardLoadFailed, { error: resetCardError })
-            : resetCardInventory &&
-              (resetCardInventory.five_hour.some((card) => card.available) ||
-                resetCardInventory.week.some((card) => card.available))
-            ? formatText(t.resetCardInventoryLine, {
-                five:
-                  resetCardInventory.five_hour.filter((card) => card.available)
-                    .length,
-                week: resetCardInventory.week.filter((card) => card.available)
-                  .length,
-              })
-            : t.resetCardInventoryEmpty
-        }
-      >
-        <div className="flex shrink-0 items-center gap-1.5">
+      {/* 重置卡库存：标题与库存数字同行、按钮独占下一整行——360px 抽屉里
+          三个按钮挤在右侧会把说明文字折成多行。 */}
+      <div className="px-5 py-3.5">
+        <div className="flex items-start gap-3">
+          <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-base-cardhover text-text-secondary">
+            <Zap size={15} />
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 text-sm font-semibold text-text-primary">
+              <span className="shrink-0">{t.resetCardInventoryTitle}</span>
+              <span className="font-mono text-xs font-medium text-text-muted">
+                {resetCardError
+                  ? ""
+                  : resetCardInventory &&
+                    (resetCardInventory.five_hour.some((card) => card.available) ||
+                      resetCardInventory.week.some((card) => card.available))
+                  ? formatText(t.resetCardInventoryLine, {
+                      five:
+                        resetCardInventory.five_hour.filter((card) => card.available)
+                          .length,
+                      week: resetCardInventory.week.filter((card) => card.available)
+                        .length,
+                    })
+                  : t.resetCardInventoryEmpty}
+              </span>
+            </div>
+            {resetCardError && (
+              <div
+                className="mt-0.5 break-all text-xs leading-relaxed text-warn"
+                title={resetCardError}
+              >
+                {formatText(t.resetCardLoadFailed, { error: resetCardError })}
+              </div>
+            )}
+          </div>
+        </div>
+        <div className="mt-2.5 flex gap-1.5 pl-10">
           <button
             onClick={() => refreshResetCardInventory()}
             disabled={resetCardLoading}
-            className="focus-ring h-8 rounded-lg border border-base-border bg-base-card px-2 text-xs font-semibold text-text-secondary transition hover:bg-base-cardhover hover:text-text-primary active:scale-[0.96] disabled:opacity-50"
+            className="focus-ring h-8 rounded-lg border border-base-border bg-base-card px-2.5 text-xs font-semibold text-text-secondary transition hover:bg-base-cardhover hover:text-text-primary active:scale-[0.96] disabled:opacity-50"
           >
             {resetCardLoading ? "…" : t.resetCardRefresh}
           </button>
@@ -738,7 +755,7 @@ export default function SettingsPanel() {
               resetCardLoading ||
               !resetCardInventory?.five_hour.some((card) => card.available)
             }
-            className="focus-ring h-8 rounded-lg border border-base-border bg-base-card px-2 text-xs font-semibold text-text-secondary transition hover:bg-base-cardhover hover:text-text-primary active:scale-[0.96] disabled:opacity-50"
+            className="focus-ring h-8 rounded-lg border border-base-border bg-base-card px-2.5 text-xs font-semibold text-text-secondary transition hover:bg-base-cardhover hover:text-text-primary active:scale-[0.96] disabled:opacity-50"
           >
             {t.resetCardUseFive}
           </button>
@@ -748,12 +765,12 @@ export default function SettingsPanel() {
               resetCardLoading ||
               !resetCardInventory?.week.some((card) => card.available)
             }
-            className="focus-ring h-8 rounded-lg border border-base-border bg-base-card px-2 text-xs font-semibold text-text-secondary transition hover:bg-base-cardhover hover:text-text-primary active:scale-[0.96] disabled:opacity-50"
+            className="focus-ring h-8 rounded-lg border border-base-border bg-base-card px-2.5 text-xs font-semibold text-text-secondary transition hover:bg-base-cardhover hover:text-text-primary active:scale-[0.96] disabled:opacity-50"
           >
             {t.resetCardUseWeek}
           </button>
         </div>
-      </Row>
+      </div>
 
       <Row
         icon={<Clock size={15} />}
