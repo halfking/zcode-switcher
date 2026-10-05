@@ -40,8 +40,16 @@ pub fn setup_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     // TODO(i18n): 托盘菜单文案固定英文。Rust 侧做本地化需要额外的 locale 机制，
     // 现有 i18n 只覆盖前端；后续若需要，可在前端启动后 invoke 一个 set_tray_labels。
     //
+    // 唯一托盘（重要）：全应用只能有这一个托盘图标。Tauri v2 在 `App::build` 阶段会为
+    // 配置里的 `app.trayIcon` 自动再建一个托盘（id 固定 "main"，与这里的
+    // "zcode-switcher-tray" 是两个独立实例 → macOS 菜单栏出现两块）。
+    // 因此 tauri.conf.json 与 tauri.macos.conf.json 都**不得**再出现 trayIcon 声明，
+    // 回归门 scripts/tray-single-icon-regression.mjs 会守住这条。历史上 1.1.15 已经因为
+    // 声明式 + 程序化重复创建修过一次，但只清理了 tauri.conf.json，漏了 macOS 专用配置。
+    //
     // TODO(icon): 复用 app 默认窗口图标（32x32.png 彩色版）。macOS 上惯例是提供
     // 单色 Template 图标以适配深浅色菜单栏，后续补 tray-icon.png + Template 变体。
+    // 注意：改用 Template 必须在这里调 `.icon_as_template(true)`，不要退回配置声明。
     let mut tray = TrayIconBuilder::with_id("zcode-switcher-tray")
         .tooltip("ZCode Switcher")
         .menu(&menu)

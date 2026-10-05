@@ -17,7 +17,8 @@
     "test:windows": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/windows-regression.ps1",
     "test:autoswitch": "node scripts/auto-switch-regression.mjs",
     "test:windowreset": "node scripts/window-reset-regression.mjs",
-    "test:resetcard": "node scripts/reset-card-regression.mjs"
+    "test:resetcard": "node scripts/reset-card-regression.mjs",
+    "test:tray": "node scripts/tray-single-icon-regression.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
