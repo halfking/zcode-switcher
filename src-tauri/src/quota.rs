@@ -458,6 +458,30 @@ fn credit_window_label(unit: i64, number: i64) -> String {
     }
 }
 
+/// 百分比 token 桶展示名（TOKENS_LIMIT：只有已用百分比、无绝对值，
+/// 窗口编码与积分桶一致）。
+fn tokens_window_label(unit: i64, number: i64) -> String {
+    match (unit, number) {
+        (3, 5) => "5小时Token".into(),
+        (3, 1) => "小时Token".into(),
+        (6, 1) => "周Token".into(),
+        (5, 1) => "月Token".into(),
+        _ => {
+            let unit_word = match unit {
+                3 => "小时",
+                5 => "月",
+                6 => "周",
+                _ => "周期",
+            };
+            if number == 1 {
+                format!("{unit_word}Token")
+            } else {
+                format!("{number}{unit_word}Token")
+            }
+        }
+    }
+}
+
 /// 工具额度桶展示名（TIME_LIMIT：MCP 工具调用次数，与积分不同量纲）。
 fn tool_window_label(unit: i64, number: i64) -> String {
     let unit_word = match unit {
@@ -480,10 +504,21 @@ fn tool_window_label(unit: i64, number: i64) -> String {
     }
 }
 
+/// nextResetTime 是毫秒时间戳；缺失/非法时返回 None（前端只做倒计时
+/// 展示与到点刷新，None 条目退回周期轮询）。
+fn parse_next_reset_ms(limit: &Value) -> Option<f64> {
+    limit
+        .get("nextResetTime")
+        .and_then(Value::as_f64)
+        .filter(|ms| ms.is_finite() && *ms > 0.0)
+        .map(|ms| ms / 1000.0)
+}
+
 /// 解析 quota/limit 响应；未订阅或字段缺失时返回 None。
 ///
 /// CREDIT_LIMIT 是积分桶（参与积分阈值判定）；TIME_LIMIT 是 MCP 工具
-/// 调用额度（次数，仅展示）；TOKENS_LIMIT 只有百分比、无绝对值，不展示。
+/// 调用额度（次数，仅展示）；TOKENS_LIMIT 是百分比 token 桶（只有已用
+/// 百分比，剩余 = 100 - percentage，前端按百分比阈值参与判定）。
 fn parse_coding_plan_usage(value: &Value) -> Option<CodingPlanSnapshot> {
     // 该接口的成功包络是 {"code":200,"success":true,...}（区别于 billing 的 code=0）。
     let code_ok = value.get("code").and_then(Value::as_i64) == Some(200);
@@ -502,6 +537,31 @@ fn parse_coding_plan_usage(value: &Value) -> Option<CodingPlanSnapshot> {
     let mut items = Vec::new();
     for limit in limits {
         let limit_type = limit.get("type").and_then(Value::as_str).unwrap_or("");
+        // TOKENS_LIMIT：百分比 token 桶。percentage 与 CREDIT_LIMIT 的同名字段
+        // 同义（已用百分比，实测 106/28000 → 1）；此前整类跳过会让百分比套餐
+        // 账号（无积分桶、billing token 为假数据）在守护判定里"无数据"。
+        // 缺 percentage 只跳过该条，不让整个快照解析失败。
+        if limit_type == "TOKENS_LIMIT" {
+            let used_pct = match limit.get("percentage").and_then(Value::as_f64) {
+                Some(v) if v.is_finite() => v.clamp(0.0, 100.0),
+                _ => continue,
+            };
+            let (unit, number) = (
+                limit.get("unit").and_then(Value::as_i64).unwrap_or(0),
+                limit.get("number").and_then(Value::as_i64).unwrap_or(0),
+            );
+            items.push(BalanceItem {
+                show_name: tokens_window_label(unit, number),
+                used_units: used_pct,
+                total_units: 100.0,
+                remaining_units: (100.0 - used_pct).max(0.0),
+                unit_type: Some("percentage".into()),
+                period: window_period(unit, number),
+                plan_id: None,
+                next_reset_at: parse_next_reset_ms(limit),
+            });
+            continue;
+        }
         if limit_type != "CREDIT_LIMIT" && limit_type != "TIME_LIMIT" {
             continue;
         }
@@ -523,13 +583,8 @@ fn parse_coding_plan_usage(value: &Value) -> Option<CodingPlanSnapshot> {
             limit.get("unit").and_then(Value::as_i64).unwrap_or(0),
             limit.get("number").and_then(Value::as_i64).unwrap_or(0),
         );
-        // nextResetTime 是毫秒时间戳；缺失/非法时留 None（前端只做倒计时
-        // 展示与到点刷新，None 条目退回周期轮询）。
-        let next_reset_at = limit
-            .get("nextResetTime")
-            .and_then(Value::as_f64)
-            .filter(|ms| ms.is_finite() && *ms > 0.0)
-            .map(|ms| ms / 1000.0);
+        // nextResetTime 缺失/非法时留 None（前端只做倒计时展示与到点刷新）。
+        let next_reset_at = parse_next_reset_ms(limit);
         let is_credit = limit_type == "CREDIT_LIMIT";
         items.push(BalanceItem {
             show_name: if is_credit {
@@ -1341,7 +1396,7 @@ mod tests {
         .unwrap();
         let snapshot = parse_coding_plan_usage(&value).expect("应解析成功");
         assert_eq!(snapshot.level, "max");
-        assert_eq!(snapshot.items.len(), 4);
+        assert_eq!(snapshot.items.len(), 5);
 
         // 5 小时窗口的"5小时积分"桶（官网同源数据）
         let credits = &snapshot.items[0];
@@ -1376,13 +1431,44 @@ mod tests {
         assert_eq!(tool.period.as_deref(), Some("monthly"));
         assert_eq!(tool.next_reset_at, Some(1790256740998.0 / 1000.0));
 
-        // TOKENS_LIMIT（仅百分比、无绝对值）不产出条目
-        assert!(snapshot
-            .items
-            .iter()
-            .all(|item| item.show_name != "5小时Token"));
+        // TOKENS_LIMIT（仅百分比）产出百分比条目：percentage=0（已用）→
+        // 剩余 100%，窗口 5h；参与百分比阈值判定。
+        let tokens = &snapshot.items[4];
+        assert_eq!(tokens.show_name, "5小时Token");
+        assert_eq!(tokens.used_units, 0.0);
+        assert_eq!(tokens.total_units, 100.0);
+        assert_eq!(tokens.remaining_units, 100.0);
+        assert_eq!(tokens.unit_type.as_deref(), Some("percentage"));
+        assert_eq!(tokens.period.as_deref(), Some("5h"));
+        assert_eq!(tokens.next_reset_at, None);
 
         assert_eq!(coding_plan_display_name(&snapshot.level), "GLM Coding Max");
+    }
+
+    #[test]
+    fn parse_coding_plan_usage_percentage_tokens() {
+        // 百分比 token 套餐（无积分桶、billing token 为假数据的账号）：
+        // percentage 是已用百分比，剩余 = 100 - percentage；周窗口带
+        // nextResetTime；超界钳到 [0,100]；缺 percentage 只跳过该条。
+        let value: Value = serde_json::from_str(
+            r#"{"code":200,"success":true,"data":{"limits":[
+                {"type":"TOKENS_LIMIT","unit":6,"number":1,"percentage":64,"nextResetTime":1789808998979},
+                {"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":150},
+                {"type":"TOKENS_LIMIT","unit":3,"number":5}
+            ],"level":"max"}}"#,
+        )
+        .unwrap();
+        let snapshot = parse_coding_plan_usage(&value).expect("应解析成功");
+        assert_eq!(snapshot.items.len(), 2);
+        let weekly = &snapshot.items[0];
+        assert_eq!(weekly.show_name, "周Token");
+        assert_eq!(weekly.used_units, 64.0);
+        assert_eq!(weekly.remaining_units, 36.0);
+        assert_eq!(weekly.unit_type.as_deref(), Some("percentage"));
+        assert_eq!(weekly.period.as_deref(), Some("weekly"));
+        assert_eq!(weekly.next_reset_at, Some(1789808998979.0 / 1000.0));
+        // 超界钳位：150% 已用 → 剩余 0。
+        assert_eq!(snapshot.items[1].remaining_units, 0.0);
     }
 
     #[test]
@@ -1453,14 +1539,17 @@ mod tests {
         let empty: Value =
             serde_json::from_str(r#"{"code":200,"data":{"limits":[],"level":"lite"}}"#).unwrap();
         assert!(parse_coding_plan_usage(&empty).is_none());
-        // 仅 TOKENS_LIMIT（无绝对值字段）→ 无可显示积分
+        // 仅 TOKENS_LIMIT 的百分比套餐：现在产出百分比条目（判定语义见
+        // parse_coding_plan_usage_percentage_tokens）。
         let tokens_only: Value = serde_json::from_str(
             r#"{"code":200,"success":true,"data":{"limits":[
                 {"type":"TOKENS_LIMIT","unit":6,"number":1,"percentage":100}
             ],"level":"max"}}"#,
         )
         .unwrap();
-        assert!(parse_coding_plan_usage(&tokens_only).is_none());
+        let snapshot = parse_coding_plan_usage(&tokens_only).expect("百分比套餐应解析成功");
+        assert_eq!(snapshot.items.len(), 1);
+        assert_eq!(snapshot.items[0].remaining_units, 0.0);
     }
 
     /// 真机端到端验证：用真实 credentials 走一遍完整刷新链路。

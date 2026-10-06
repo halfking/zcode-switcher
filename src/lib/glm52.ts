@@ -117,6 +117,12 @@ export function pointBalances(quota?: QuotaInfo): BalanceItem[] {
   return quota?.balances?.filter((item) => item.unit_type === "point") ?? [];
 }
 
+// 百分比 token 条目（quota/limit 的 TOKENS_LIMIT 桶，unit_type === "percentage"，
+// 如"周Token"）：只有已用百分比、无绝对值，剩余以 0-100 计。
+export function percentBalances(quota?: QuotaInfo): BalanceItem[] {
+  return quota?.balances?.filter((item) => item.unit_type === "percentage") ?? [];
+}
+
 /**
  * 账号可用积分 = 各积分桶剩余的最小值（最紧的桶决定账号可用性：
  * 任一窗口的积分耗尽都会被限流），无积分条目时返回 null。
@@ -128,18 +134,40 @@ export function glmPointRemaining(quota?: QuotaInfo): number | null {
 }
 
 /**
- * 当前账号是否应触发切换：token 与积分任一量纲跌破对应阈值即触发。
- * 条目缺失的量纲不参与判定（该账号可能根本不含此量纲的套餐）。
+ * 百分比 token 维度的剩余（%）：各窗口剩余的最小值（最紧的窗口决定
+ * 可用性，与积分桶同语义），无百分比条目时返回 null。
+ */
+export function glmPercentRemaining(quota?: QuotaInfo): number | null {
+  const items = percentBalances(quota);
+  if (items.length === 0) return null;
+  return Math.min(...items.map(balanceRemaining));
+}
+
+/**
+ * 百分比 token 维度的切换阈值（%）：剩余百分比低于该值触发切换。
+ * 百分比套餐（quota/limit 只有 TOKENS_LIMIT 的账号）此前完全无法参与
+ * 守护判定，该阈值让这类账号与 token/积分量纲同规则切换。
+ */
+export const DEFAULT_PERCENT_THRESHOLD = 10;
+export const PERCENT_THRESHOLD_MIN = 1;
+export const PERCENT_THRESHOLD_MAX = 50;
+
+/**
+ * 当前账号是否应触发切换：token、积分、百分比任一量纲跌破对应阈值即
+ * 触发。条目缺失的量纲不参与判定（该账号可能根本不含此量纲的套餐）。
  */
 export function isAccountLow(
   quota: QuotaInfo | undefined,
   tokenThresholdWan: number,
-  pointThreshold: number
+  pointThreshold: number,
+  percentThreshold: number = DEFAULT_PERCENT_THRESHOLD
 ): boolean {
   const token = glm52Remaining(quota);
   if (token !== null && token < tokenThresholdWan * 10_000) return true;
   const point = glmPointRemaining(quota);
   if (point !== null && point < pointThreshold) return true;
+  const percent = glmPercentRemaining(quota);
+  if (percent !== null && percent < percentThreshold) return true;
   return false;
 }
 
@@ -151,14 +179,17 @@ export function isAccountLow(
 export function isSwitchableCandidate(
   quota: QuotaInfo | undefined,
   tokenThresholdWan: number,
-  pointThreshold: number
+  pointThreshold: number,
+  percentThreshold: number = DEFAULT_PERCENT_THRESHOLD
 ): boolean {
   if (!quota || quota.error) return false;
   const token = glm52Remaining(quota);
   const point = glmPointRemaining(quota);
-  if (token === null && point === null) return false;
+  const percent = glmPercentRemaining(quota);
+  if (token === null && point === null && percent === null) return false;
   if (token !== null && token <= tokenThresholdWan * 10_000) return false;
   if (point !== null && point <= pointThreshold) return false;
+  if (percent !== null && percent <= percentThreshold) return false;
   return true;
 }
 
@@ -169,7 +200,8 @@ export function isSwitchableCandidate(
 export function accountHeadroom(
   quota: QuotaInfo | undefined,
   tokenThresholdWan: number,
-  pointThreshold: number
+  pointThreshold: number,
+  percentThreshold: number = DEFAULT_PERCENT_THRESHOLD
 ): number {
   let headroom = Number.POSITIVE_INFINITY;
   const token = glm52Remaining(quota);
@@ -179,6 +211,10 @@ export function accountHeadroom(
   const point = glmPointRemaining(quota);
   if (point !== null && pointThreshold > 0) {
     headroom = Math.min(headroom, point / pointThreshold);
+  }
+  const percent = glmPercentRemaining(quota);
+  if (percent !== null && percentThreshold > 0) {
+    headroom = Math.min(headroom, percent / percentThreshold);
   }
   return headroom;
 }
@@ -350,10 +386,16 @@ export function dynamicQuotaRefreshIntervalMs(
   quota: QuotaInfo | undefined,
   tokenThresholdWan: number,
   pointThreshold: number,
-  paused: boolean
+  paused: boolean,
+  percentThreshold: number = DEFAULT_PERCENT_THRESHOLD
 ): number {
   if (paused) return DYNAMIC_REFRESH_MAX_MS;
-  const headroom = accountHeadroom(quota, tokenThresholdWan, pointThreshold);
+  const headroom = accountHeadroom(
+    quota,
+    tokenThresholdWan,
+    pointThreshold,
+    percentThreshold
+  );
   if (!Number.isFinite(headroom)) return DYNAMIC_REFRESH_MID_MS;
   if (headroom <= 1) return DYNAMIC_REFRESH_MIN_MS;
   if (headroom <= 3) return DYNAMIC_REFRESH_MID_MS;
@@ -372,7 +414,8 @@ export function computeGlm52PoolStats(
   profiles: ProfileView[],
   quotas: Record<string, QuotaInfo>,
   thresholdWan: number,
-  pointThreshold = 0
+  pointThreshold = 0,
+  percentThreshold: number = DEFAULT_PERCENT_THRESHOLD
 ): Glm52PoolStats {
   const thresholdUnits = thresholdWan * 10_000;
   let usedAccounts = 0;
@@ -398,7 +441,10 @@ export function computeGlm52PoolStats(
     usedUnits += used;
 
     // token 或积分任一量纲低于阈值即计入"已用完"账号。
-    if (remaining < thresholdUnits || isAccountLow(quotas[profile.id], thresholdWan, pointThreshold)) {
+    if (
+      remaining < thresholdUnits ||
+      isAccountLow(quotas[profile.id], thresholdWan, pointThreshold, percentThreshold)
+    ) {
       usedAccounts += 1;
       usedBelowThresholdUnits += thresholdUnits - remaining;
     }

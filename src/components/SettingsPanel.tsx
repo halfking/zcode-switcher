@@ -367,6 +367,8 @@ export default function SettingsPanel() {
     setGlm52AutoSwitchThresholdWan,
     glm52AutoSwitchPointThreshold,
     setGlm52AutoSwitchPointThreshold,
+    glm52AutoSwitchPercentThreshold,
+    setGlm52AutoSwitchPercentThreshold,
     glm52LowQuotaAction,
     setGlm52LowQuotaAction,
     glm52ExhaustRestartZcode,
@@ -647,6 +649,27 @@ export default function SettingsPanel() {
             className="focus-ring h-8 w-20 rounded-lg border border-base-border bg-base-card px-2 text-right text-sm font-semibold text-text-primary outline-none transition hover:bg-base-cardhover"
           />
           <span className="text-xs font-medium text-text-muted">{t.pointUnit}</span>
+        </div>
+      </Row>
+
+      <Row
+        icon={<Clock size={15} />}
+        title={t.glmPercentThresholdTitle}
+        desc={t.glmPercentThresholdDesc}
+      >
+        <div className="flex items-center gap-2">
+          <input
+            type="number"
+            min={1}
+            max={50}
+            step={1}
+            value={glm52AutoSwitchPercentThreshold}
+            onChange={(e) =>
+              setGlm52AutoSwitchPercentThreshold(Number(e.currentTarget.value))
+            }
+            className="focus-ring h-8 w-20 rounded-lg border border-base-border bg-base-card px-2 text-right text-sm font-semibold text-text-primary outline-none transition hover:bg-base-cardhover"
+          />
+          <span className="text-xs font-medium text-text-muted">{t.percentUnit}</span>
         </div>
       </Row>
 

@@ -57,8 +57,10 @@ export function QuotaBar({
   const remainingPct =
     total > 0 ? Math.min(100, Math.max(0, (remaining / total) * 100)) : 0;
   const color = colorFor(remainingPct);
-  // 积分制套餐（GLM Coding 个人套餐）：单位是积分而非 token，展示时带单位。
-  const unit = item.unit_type === "point" ? " 积分" : "";
+  // 单位标注：积分桶带"积分"；百分比 token 桶（total=100）以 % 呈现，
+  // 宽视图不再重复"x% / 100%"。
+  const isPercent = item.unit_type === "percentage";
+  const unit = isPercent ? "%" : item.unit_type === "point" ? " 积分" : "";
   // 重置倒计时（next_reset_at 有值才展示；已过期交给到点刷新，不显示）。
   const resetAtMs = (item.next_reset_at ?? 0) * 1000;
   const now = useNowTick(resetAtMs > 0);
@@ -118,9 +120,15 @@ export function QuotaBar({
         />
       </div>
       <span className="w-36 shrink-0 text-right font-mono text-[11px] text-text-muted">
-        {fmt(remaining)}
-        {unit} / {fmt(total)}
-        {unit}
+        {isPercent ? (
+          `${fmt(remaining)}%`
+        ) : (
+          <>
+            {fmt(remaining)}
+            {unit} / {fmt(total)}
+            {unit}
+          </>
+        )}
         {countdown && (
           <span className="block text-[9px] font-medium leading-tight text-text-muted/70">
             {resetLabel}

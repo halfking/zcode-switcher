@@ -127,6 +127,8 @@ const pt = (n: number) => ({
 });
 
 async function arm(ids: string[], activeId: string, scripts: Record<string, (call: number) => any>) {
+  // 批量刷新的账号间错峰（429 全局节流）会把每轮 cycle 拖慢秒级，测试里置 0。
+  (globalThis as any).__quotaRefreshStaggerMs = 0;
   (globalThis as any).__quotaScripts = scripts;
   const st = useStore.getState();
   st.setGlm52AutoSwitchEnabled(true);

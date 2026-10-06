@@ -105,6 +105,7 @@ export default function App() {
     glm52AutoSwitchEnabled,
     glm52AutoSwitchThresholdWan,
     glm52AutoSwitchPointThreshold,
+    glm52AutoSwitchPercentThreshold,
     switchVerifyProgress,
     floatingWindowMode,
     floatingWindowScale,
@@ -307,7 +308,8 @@ export default function App() {
       active ? state.quotas[active.id] : undefined,
       state.glm52AutoSwitchThresholdWan,
       state.glm52AutoSwitchPointThreshold,
-      state.autoSwitchPaused
+      state.autoSwitchPaused,
+      state.glm52AutoSwitchPercentThreshold
     );
   }, [activeQuotaRefreshIntervalMinutes, glm52AutoSwitchEnabled]);
 
@@ -731,6 +733,7 @@ export default function App() {
         quotas={quotas}
         thresholdWan={glm52AutoSwitchThresholdWan}
         pointThreshold={glm52AutoSwitchPointThreshold}
+        percentThreshold={glm52AutoSwitchPercentThreshold}
         language={language}
         scale={floatingWindowScale}
         resizerOpen={floatingResizerOpen}

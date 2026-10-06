@@ -37,9 +37,12 @@ await writeFile(apiStubPath, apiStub);
 
 const entryPath = join(dir, "entry.mjs");
 const entry = `
-  import { isCurrentEntryLow, pickPlanSwitchTarget, currentPlanEntry, entryHealth, firstVerifiedTarget }
+  import { isCurrentEntryLow, pickPlanSwitchTarget, currentPlanEntry, entryHealth, firstVerifiedTarget, entryOfBalance }
     from ${JSON.stringify(posix(join(process.cwd(), "src/lib/quotaGuard.ts")))};
-  globalThis.__qg = { isCurrentEntryLow, pickPlanSwitchTarget, currentPlanEntry, entryHealth, firstVerifiedTarget };
+  import { isAccountLow, isSwitchableCandidate, accountHeadroom, glmPercentRemaining, DEFAULT_PERCENT_THRESHOLD }
+    from ${JSON.stringify(posix(join(process.cwd(), "src/lib/glm52.ts")))};
+  globalThis.__qg = { isCurrentEntryLow, pickPlanSwitchTarget, currentPlanEntry, entryHealth, firstVerifiedTarget,
+    entryOfBalance, isAccountLow, isSwitchableCandidate, accountHeadroom, glmPercentRemaining, DEFAULT_PERCENT_THRESHOLD };
 `;
 await writeFile(entryPath, entry);
 
@@ -64,6 +67,12 @@ const {
   currentPlanEntry,
   entryHealth,
   firstVerifiedTarget,
+  entryOfBalance,
+  isAccountLow,
+  isSwitchableCandidate,
+  accountHeadroom,
+  glmPercentRemaining,
+  DEFAULT_PERCENT_THRESHOLD,
 } = globalThis.__qg;
 
 // ---- fixtures --------------------------------------------------------------
@@ -91,6 +100,19 @@ function tokenItem(remaining, name = "GLM-5.3") {
     unit_type: "token",
     period: "weekly",
     plan_id: "start-plan",
+  };
+}
+// 百分比 token 桶（quota/limit 的 TOKENS_LIMIT）：total=100，
+// remaining_units = 100 - 已用百分比，unit_type "percentage"。
+function percentItem(remainingPct, name = "周Token") {
+  return {
+    show_name: name,
+    used_units: 100 - remainingPct,
+    total_units: 100,
+    remaining_units: remainingPct,
+    unit_type: "percentage",
+    period: "weekly",
+    plan_id: "personal:glm-coding",
   };
 }
 
@@ -333,6 +355,80 @@ function candidateOk(quota) {
   const last = progress[progress.length - 1];
   assert.ok(last.done >= 2, "胜者确定前 A、B 应已出结果");
   console.log("[10] 并发验证：优先级语义 / 并发上限 / 超时 / 进度 PASS");
+}
+
+// ---- 11. 百分比套餐：入口映射与整账号回退 -----------------------------------
+//
+// ciorf900 型账号：无积分桶、billing token 为假数据，额度只有 quota/limit
+// 的 TOKENS_LIMIT 百分比桶。此前这类条目不产出，账号在守护里"无数据"。
+
+{
+  assert.equal(DEFAULT_PERCENT_THRESHOLD, 10, "百分比默认阈值应为 10%");
+  const quota = {
+    balances: [percentItem(36)],
+    active_provider: "coding-plan:builtin:bigmodel-coding-plan",
+  };
+  assert.equal(entryOfBalance(quota.balances[0]), null, "百分比条目不归属任何套餐入口");
+  const health = entryHealth(quota, "coding-plan", TOKEN_THRESHOLD_WAN, POINT_THRESHOLD);
+  assert.equal(health.evaluable, false, "coding-plan 入口无积分数据仍不可评估");
+  assert.equal(glmPercentRemaining(quota), 36, "百分比维度剩余应取窗口最小值");
+  assert.equal(
+    isCurrentEntryLow(quota, TOKEN_THRESHOLD_WAN, POINT_THRESHOLD),
+    false,
+    "剩余 36% 高于默认阈值 10% 不应触发"
+  );
+  // 剩余 5% → 回退整账号判定后由百分比维度触发。
+  const low = { balances: [percentItem(5)], active_provider: quota.active_provider };
+  assert.equal(
+    isCurrentEntryLow(low, TOKEN_THRESHOLD_WAN, POINT_THRESHOLD),
+    true,
+    "剩余 5% 低于默认阈值应触发切号"
+  );
+  // 多窗口取最紧的：5h 80% + 周 5% → 低。
+  const tight = {
+    balances: [percentItem(80, "5小时Token"), percentItem(5, "周Token")],
+    active_provider: quota.active_provider,
+  };
+  assert.equal(
+    isAccountLow(tight, TOKEN_THRESHOLD_WAN, POINT_THRESHOLD),
+    true,
+    "任一百分比窗口低于阈值即触发"
+  );
+  console.log("[11] 百分比套餐：入口映射与回退判定 PASS");
+}
+
+// ---- 12. 百分比候选判定与余量 ------------------------------------------------
+
+{
+  const fresh = { balances: [percentItem(80)] };
+  const exhausted = { balances: [percentItem(0)] };
+  assert.equal(
+    isSwitchableCandidate(fresh, TOKEN_THRESHOLD_WAN, POINT_THRESHOLD, 10),
+    true,
+    "百分比充足的账号可成为切换目标"
+  );
+  assert.equal(
+    isSwitchableCandidate(exhausted, TOKEN_THRESHOLD_WAN, POINT_THRESHOLD, 10),
+    false,
+    "百分比耗尽的账号不能成为切换目标"
+  );
+  assert.equal(
+    isAccountLow({ balances: [percentItem(11)] }, TOKEN_THRESHOLD_WAN, POINT_THRESHOLD, 10),
+    false,
+    "高于显式阈值不触发"
+  );
+  assert.equal(
+    isAccountLow({ balances: [percentItem(9)] }, TOKEN_THRESHOLD_WAN, POINT_THRESHOLD, 10),
+    true,
+    "低于显式阈值触发"
+  );
+  // headroom：剩余 80% / 阈值 10% = 8。
+  assert.equal(
+    accountHeadroom(fresh, TOKEN_THRESHOLD_WAN, POINT_THRESHOLD, 10),
+    8,
+    "百分比余量应按 阈值百分比 折算参与排序"
+  );
+  console.log("[12] 百分比候选判定与余量 PASS");
 }
 
 // ---- 清理 ------------------------------------------------------------------

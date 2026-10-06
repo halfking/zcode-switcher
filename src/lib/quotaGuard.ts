@@ -1,5 +1,5 @@
 import type { BalanceItem, PlanEntryTarget, QuotaInfo } from "./api";
-import { isAccountLow } from "./glm52";
+import { isAccountLow, DEFAULT_PERCENT_THRESHOLD } from "./glm52";
 
 /**
  * 帐号内套餐入口判定。
@@ -18,6 +18,9 @@ import { isAccountLow } from "./glm52";
 export function entryOfBalance(item: BalanceItem): PlanEntryTarget | null {
   if (item.unit_type === "point") return "coding-plan";
   if (item.unit_type === "tool") return null;
+  // 百分比 token 桶（TOKENS_LIMIT）：账号级第三量纲，不归属任何入口——
+  // 切入口改变不了它的消耗，其低额度只能靠切账号（见 isAccountLow）。
+  if (item.unit_type === "percentage") return null;
   const name = item.show_name.trim().toLowerCase();
   const monitored = ["glm-5.3", "glm-5.3-flash"].some((model) => name.includes(model));
   return monitored ? "start-plan" : null;
@@ -88,8 +91,8 @@ export function currentPlanEntry(
 }
 
 /**
- * 当前入口是否低于阈值。两类情况回退到整账号判定（token 与积分任一
- * 量纲低于阈值即视为低）：
+ * 当前入口是否低于阈值。两类情况回退到整账号判定（token、积分、百分比
+ * 任一量纲低于阈值即视为低）：
  * 1. 入口无法识别（active_provider 缺失或指向非套餐入口）；
  * 2. 入口可识别但无该套餐的余额数据（evaluable=false），例如账号只
  *    订阅了 Coding Plan、却把当前入口设到了 start-plan。这种情况下
@@ -98,12 +101,15 @@ export function currentPlanEntry(
 export function isCurrentEntryLow(
   quota: QuotaInfo | undefined,
   tokenThresholdWan: number,
-  pointThreshold: number
+  pointThreshold: number,
+  percentThreshold: number = DEFAULT_PERCENT_THRESHOLD
 ): boolean {
   const entry = currentPlanEntry(quota?.active_provider);
-  if (!entry) return isAccountLow(quota, tokenThresholdWan, pointThreshold);
+  if (!entry) return isAccountLow(quota, tokenThresholdWan, pointThreshold, percentThreshold);
   const health = entryHealth(quota, entry, tokenThresholdWan, pointThreshold);
-  if (!health.evaluable) return isAccountLow(quota, tokenThresholdWan, pointThreshold);
+  if (!health.evaluable) {
+    return isAccountLow(quota, tokenThresholdWan, pointThreshold, percentThreshold);
+  }
   return health.low;
 }
 

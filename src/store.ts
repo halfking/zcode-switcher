@@ -15,8 +15,11 @@ import {
 import {
   accountHeadroom,
   decideResetCard,
+  DEFAULT_PERCENT_THRESHOLD,
   glm52Remaining,
   isSwitchableCandidate,
+  PERCENT_THRESHOLD_MAX,
+  PERCENT_THRESHOLD_MIN,
 } from "./lib/glm52";
 import {
   currentPlanEntry,
@@ -57,6 +60,29 @@ const GLM52_DEFAULT_THRESHOLD_WAN = 200;
 const GLM52_POINT_THRESHOLD_MIN = 10;
 const GLM52_POINT_THRESHOLD_MAX = 5000;
 const GLM52_DEFAULT_POINT_THRESHOLD = 200;
+// 百分比阈值（quota/limit 只有 TOKENS_LIMIT 的百分比 token 套餐）：
+// 剩余百分比低于该值触发切换；上下限与默认值以 glm52.ts 为准。
+const GLM52_PERCENT_THRESHOLD_MIN = PERCENT_THRESHOLD_MIN;
+const GLM52_PERCENT_THRESHOLD_MAX = PERCENT_THRESHOLD_MAX;
+const GLM52_DEFAULT_PERCENT_THRESHOLD = DEFAULT_PERCENT_THRESHOLD;
+// 多账号顺序刷新的账号间隔（毫秒）：逐账号拉额度会对 open.bigmodel.cn
+// 连发请求，账号一多就撞 429；每账号之间稍作停顿把突发摊平。候选验证
+// 的扇出已由 candidateVerifyConcurrency 单独约束，这里管的是批量刷新。
+const QUOTA_REFRESH_STAGGER_MS = 1000;
+/** 读取账号错峰间隔；回归测试可设 globalThis.__quotaRefreshStaggerMs 覆写
+ * （auto-switch 回归置 0，避免拖慢逐场景子进程）。 */
+function quotaRefreshStaggerMs(): number {
+  const override = Number(
+    (globalThis as { __quotaRefreshStaggerMs?: unknown }).__quotaRefreshStaggerMs
+  );
+  return Number.isFinite(override) && override >= 0 ? override : QUOTA_REFRESH_STAGGER_MS;
+}
+
+/** 批量刷新多账号时的账号间停顿：把对 open.bigmodel.cn 的顺序请求摊开。 */
+async function staggerBetweenAccountRefreshes(): Promise<void> {
+  const ms = quotaRefreshStaggerMs();
+  if (ms > 0) await new Promise((resolve) => setTimeout(resolve, ms));
+}
 const DEFAULT_LOW_QUOTA_ACTION: LowQuotaAction = "switch";
 // 帐号内套餐切换的防抖：成功后 60 秒内不重复切换，失败后 10 分钟再重试。
 const PLAN_SWITCH_COOLDOWN_MS = 60_000;
@@ -107,6 +133,8 @@ interface AppState {
   glm52AutoSwitchThresholdWan: number;
   /** 自动切换阈值（账号积分剩余），单位：积分；各积分桶取最小值参与判定 */
   glm52AutoSwitchPointThreshold: number;
+  /** 百分比 token 维度切换阈值（%），见 DEFAULT_PERCENT_THRESHOLD。 */
+  glm52AutoSwitchPercentThreshold: number;
   /** 低额度时的动作方式（见 LowQuotaAction 注释） */
   glm52LowQuotaAction: LowQuotaAction;
   /**
@@ -190,6 +218,7 @@ interface AppState {
   setGlm52AutoSwitchEnabled: (v: boolean) => void;
   setGlm52AutoSwitchThresholdWan: (v: number) => void;
   setGlm52AutoSwitchPointThreshold: (v: number) => void;
+  setGlm52AutoSwitchPercentThreshold: (v: number) => void;
   setGlm52LowQuotaAction: (v: LowQuotaAction) => void;
   setGlm52ExhaustRestartZcode: (v: boolean) => void;
   setGlm52AutoResetCardEnabled: (v: boolean) => void;
@@ -379,6 +408,23 @@ function loadGlm52AutoSwitchPointThreshold(): number {
       : GLM52_DEFAULT_POINT_THRESHOLD;
   } catch {
     return GLM52_DEFAULT_POINT_THRESHOLD;
+  }
+}
+function clampGlm52PercentThreshold(n: number): number {
+  // Number(null)===0：localStorage 无值时不能把 0 当合法输入钳到最小值。
+  if (!Number.isFinite(n) || n <= 0) return GLM52_DEFAULT_PERCENT_THRESHOLD;
+  return Math.max(
+    GLM52_PERCENT_THRESHOLD_MIN,
+    Math.min(GLM52_PERCENT_THRESHOLD_MAX, Math.round(n))
+  );
+}
+function loadGlm52AutoSwitchPercentThreshold(): number {
+  try {
+    return clampGlm52PercentThreshold(
+      Number(localStorage.getItem("zcs:glm52AutoSwitchPercentThreshold"))
+    );
+  } catch {
+    return GLM52_DEFAULT_PERCENT_THRESHOLD;
   }
 }
 function loadGlm52LowQuotaAction(): LowQuotaAction {
@@ -662,7 +708,8 @@ async function maybeSwitchGlm52Account(getStore: () => AppState) {
 
   const tokenWan = state.glm52AutoSwitchThresholdWan;
   const pointThreshold = state.glm52AutoSwitchPointThreshold;
-  const currentLow = isCurrentEntryLow(activeQuota, tokenWan, pointThreshold);
+  const percentThreshold = state.glm52AutoSwitchPercentThreshold;
+  const currentLow = isCurrentEntryLow(activeQuota, tokenWan, pointThreshold, percentThreshold);
 
   if (state.glm52LowQuotaAction === "pause") {
     if (!currentLow) {
@@ -800,7 +847,7 @@ async function maybeSwitchGlm52Account(getStore: () => AppState) {
         await state.refreshQuota(active.id);
         const freshActive = getStore().quotas[active.id];
         const freshOk = !!freshActive && !freshActive.error;
-        if (freshOk && !isCurrentEntryLow(freshActive, tokenWan, pointThreshold)) {
+        if (freshOk && !isCurrentEntryLow(freshActive, tokenWan, pointThreshold, percentThreshold)) {
           // 复核发现当前入口余额已恢复：无需任何切换。
           if (getStore().autoSwitchPaused) {
             getStore().setAutoSwitchPaused(false);
@@ -881,10 +928,12 @@ async function maybeSwitchGlm52Account(getStore: () => AppState) {
   const orderedCandidates = state.profiles
     .filter((p) => p.id !== active.id)
     .map((profile) => ({ profile, quota: state.quotas[profile.id] }))
-    .filter((item) => isSwitchableCandidate(item.quota, tokenWan, pointThreshold))
+    .filter((item) =>
+      isSwitchableCandidate(item.quota, tokenWan, pointThreshold, percentThreshold)
+    )
     .map((item) => ({
       ...item,
-      headroom: accountHeadroom(item.quota, tokenWan, pointThreshold),
+      headroom: accountHeadroom(item.quota, tokenWan, pointThreshold, percentThreshold),
       tokenRemaining: glm52Remaining(item.quota) ?? 0,
     }))
     .sort((a, b) => b.headroom - a.headroom || b.tokenRemaining - a.tokenRemaining);
@@ -918,7 +967,7 @@ async function maybeSwitchGlm52Account(getStore: () => AppState) {
         return getStore().quotas[item.profile.id];
       },
       (_item, fresh) =>
-        isSwitchableCandidate(fresh ?? undefined, tokenWan, pointThreshold),
+        isSwitchableCandidate(fresh ?? undefined, tokenWan, pointThreshold, percentThreshold),
       {
         concurrency: getStore().candidateVerifyConcurrency,
         timeoutMs: getStore().candidateVerifyTimeoutMs,
@@ -994,6 +1043,7 @@ export const useStore = create<AppState>((set, get) => {
     glm52AutoSwitchEnabled: loadGlm52AutoSwitchEnabled(),
     glm52AutoSwitchThresholdWan: loadGlm52AutoSwitchThresholdWan(),
     glm52AutoSwitchPointThreshold: loadGlm52AutoSwitchPointThreshold(),
+    glm52AutoSwitchPercentThreshold: loadGlm52AutoSwitchPercentThreshold(),
     glm52LowQuotaAction: loadGlm52LowQuotaAction(),
     glm52ExhaustRestartZcode: loadGlm52ExhaustRestartZcode(),
     glm52AutoResetCardEnabled: loadGlm52AutoResetCardEnabled(),
@@ -1276,8 +1326,10 @@ export const useStore = create<AppState>((set, get) => {
       const state = get();
       const { refreshQuota } = state;
       const ordered = orderedProfilesForRefresh(state, orderedIds);
-      for (const p of ordered) {
-        await refreshQuota(p.id);
+      for (let index = 0; index < ordered.length; index += 1) {
+        // 账号间错峰：避免对 open.bigmodel.cn 连发请求触发 429。
+        if (index > 0) await staggerBetweenAccountRefreshes();
+        await refreshQuota(ordered[index].id);
       }
       await maybeSwitchGlm52Account(get);
     } finally {
@@ -1289,11 +1341,14 @@ export const useStore = create<AppState>((set, get) => {
   refreshMissingQuota: async () => {
     // 只刷新还没有额度数据的账号，逐个 await
     const { profiles, quotas, refreshQuota } = get();
+    let refreshed = 0;
     for (const p of profiles) {
       const q = quotas[p.id];
       const hasData = !!q && ((q.balances?.length ?? 0) > 0 || !!q.plan_name);
       if (!hasData) {
+        if (refreshed > 0) await staggerBetweenAccountRefreshes();
         await refreshQuota(p.id);
+        refreshed += 1;
       }
     }
   },
@@ -1306,9 +1361,12 @@ export const useStore = create<AppState>((set, get) => {
       const state = get();
       const { refreshQuota, tryNoRestartSwitch } = state;
       const ordered = orderedProfilesForRefresh(state, orderedIds);
+      let refreshed = 0;
       for (const p of ordered) {
         if (tryNoRestartSwitch && p.active) continue;
+        if (refreshed > 0) await staggerBetweenAccountRefreshes();
         await refreshQuota(p.id);
+        refreshed += 1;
       }
       await maybeSwitchGlm52Account(get);
     } finally {
@@ -1327,10 +1385,14 @@ export const useStore = create<AppState>((set, get) => {
     // 5 小时/周窗口到点：刷新过点账号，让卡片剩余额与耗尽状态复位。
     // 刷新后必须重评自动切换 —— 被重置的可能是非当前账号，普通
     // refreshQuota 不会触发评估，耗尽暂停会一直挂到下轮批量刷新。
+    let refreshed = 0;
     for (const id of ids) {
       const exists = get().profiles.some((p) => p.id === id);
       if (!exists) continue;
+      // 5h 窗口边界会让大量账号同时到点：同样按错峰间隔摊开请求。
+      if (refreshed > 0) await staggerBetweenAccountRefreshes();
       await get().refreshQuota(id);
+      refreshed += 1;
     }
     await maybeSwitchGlm52Account(get);
   },
@@ -1500,6 +1562,16 @@ export const useStore = create<AppState>((set, get) => {
       /* ignore */
     }
     set({ glm52AutoSwitchPointThreshold: point });
+  },
+
+  setGlm52AutoSwitchPercentThreshold: (v) => {
+    const percent = clampGlm52PercentThreshold(v);
+    try {
+      localStorage.setItem("zcs:glm52AutoSwitchPercentThreshold", String(percent));
+    } catch {
+      /* ignore */
+    }
+    set({ glm52AutoSwitchPercentThreshold: percent });
   },
 
   setAutoSwitchPaused: (v) => {

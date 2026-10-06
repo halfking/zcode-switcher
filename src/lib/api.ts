@@ -30,6 +30,9 @@ export interface BalanceItem {
   used_units: number;
   total_units: number;
   remaining_units: number;
+  /** 量纲："point" 积分桶、"tool" 工具额度、"percentage" 百分比 token 桶
+   *  （quota/limit 的 TOKENS_LIMIT，total=100、剩余=100-已用百分比）、
+   *  "token"/null 为 billing 的绝对 token 桶。 */
   unit_type: string | null;
   period: string | null;
   /** 条目所属套餐的 plan_id（个人套餐积分组为 "personal:glm-coding"）。 */
