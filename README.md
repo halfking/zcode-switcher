@@ -94,6 +94,19 @@ macOS 安装包尚未完成 Apple Developer ID 公证，首次打开可能需要
   <img src="docs/images/floating-window.png" alt="胶囊悬浮窗" width="320" />
 </p>
 
+## 与 magpie 一起用
+
+本工具管的账号池，可以直接作为 magpie 的一个 provider 端出去：
+
+- 插件：[halfking/magpie-zcode-pool](https://github.com/halfking/magpie-zcode-pool)
+  —— 读取本工具的账号池（`~/.zcode/v2/account-profiles/`），账号额度用完时自动换下一个
+- 装法：`magpie plugin add <本地目录>` → `magpie plugin login zcode-pool`
+- 效果：magpie 的网关多出 `zcode-pool/GLM-5.3`、`zcode-pool/GLM-5.2` 等模型，
+  任意 Agent 都能用；本工具负责账号与额度，magpie 负责路由、用量与界面
+
+两个插件可以并存：官方的 `@magpie-community/opencode-zcode-auth` 是单账号登录
+（OAuth、团队席位、Start Plan 归它管），`zcode-pool` 是本机多账号池。
+
 ## 文档
 
 - [使用说明](docs/usage.md)
