@@ -27,7 +27,7 @@
 
 ## Overview
 
-ZCode Switcher saves and manages multiple ZCode accounts locally. It supports quota display, seamless account switching without restarting ZCode, and GLM-5.2 low-quota auto switching.
+ZCode Switcher saves and manages multiple ZCode accounts locally. It supports quota display, seamless account switching without restarting ZCode, and GLM-5.3 low-quota auto switching.
 
 All account profiles are stored on your own computer and are not uploaded to any third-party server.
 
@@ -41,8 +41,8 @@ All account profiles are stored on your own computer and are not uploaded to any
 | Quota display | Show quota, subscription status, and refresh results |
 | Reset windows | Quota cards show countdowns to 5-hour/weekly/monthly window resets; the toolbar counts cards per window; accounts auto-refresh when a window resets so exhausted states clear on their own |
 | Reset cards | Opt-in auto-use: when a window drops to ≤1% (adjustable), spend a reset card to refill it; weekly card is chosen when the weekly balance is ≤5% (adjustable) or exhausted, otherwise the 5-hour card; inventory display and manual use built in |
-| GLM-5.2 auto switching | On low quota, switch to another plan with balance inside the account first, then switch accounts once all plans are exhausted; a pause mode is also available for manual handling |
-| Capsule floating window | Show GLM-5.2 account pool stats and support resizing |
+| GLM-5.3 auto switching | On low quota, switch to another plan with balance inside the account first, then switch accounts once all plans are exhausted; a pause mode is also available for manual handling |
+| Capsule floating window | Show GLM-5.3 account pool stats and support resizing |
 | Scheduled refresh | Refresh quota by minute and keep the latest quota data after closing the app |
 | Multi-language UI | Supports Chinese, English, and Russian |
 | In-app updates | Check for new versions, view release notes, download, and install updates in the app |
@@ -63,7 +63,7 @@ The macOS build is not yet notarized with an Apple Developer ID. On first launch
 3. To add more accounts, switch accounts in ZCode first, use OAuth login in the tool, or import a JSON / ZIP backup file.
 4. Saved accounts will show nickname, subscription expiration date, quota progress bars, and refresh status in the list.
 5. After enabling seamless switching, click the switch button on an account card to switch accounts. The switch does not require restarting ZCode, and the account config takes effect immediately.
-6. If you use GLM-5.2, enable low-quota auto switching. The default "auto switch plan/account" mode first switches to another plan with balance inside the current account, and switches to an account with more remaining quota only after all plans fall below the threshold. Alternatively, choose "pause execution" to block requests and wait for manual handling when the quota drops below the threshold.
+6. If you use GLM-5.3, enable low-quota auto switching. The default "auto switch plan/account" mode first switches to another plan with balance inside the current account, and switches to an account with more remaining quota only after all plans fall below the threshold. Alternatively, choose "pause execution" to block requests and wait for manual handling when the quota drops below the threshold.
 7. If you want account pool status to stay visible, enable capsule floating mode and place the quota stats in a desktop corner.
 
 ## Screenshots
