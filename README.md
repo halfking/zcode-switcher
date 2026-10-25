@@ -104,7 +104,7 @@ macOS 安装包尚未完成 Apple Developer ID 公证，首次打开可能需要
 - 效果：magpie 的网关多出 `zcode-pool/GLM-5.3`、`zcode-pool/GLM-5.2` 等模型，
   任意 Agent 都能用；本工具负责账号与额度，magpie 负责路由、用量与界面
 
-接上以后有四件事：
+接上以后有五件事：
 
 - **换帐号登录**：`magpie plugin login zcode-pool` 会让你挑池里的哪个账号；每登录一次，
   magpie 里就多一个独立账号，各带自己的额度卡，路由组可以在它们之间挑
@@ -114,6 +114,10 @@ macOS 安装包尚未完成 Apple Developer ID 公证，首次打开可能需要
   （provider 选项里可以关掉这个接力，改由 magpie 自己的路由组换账号）
 - **重置卡（只读）**：magpie 的额度卡上还多一行 `↺` 重置次数（还剩几张能回满额度的卡），
   读的是本工具用的同一个厂商接口；**用卡仍在本工具里做**，插件只读不扣卡
+- **赠券（只读）**：额度卡上还有 `-Trial` 的条目（ZCode 1024 Dev Day 的 token 桶），
+  每个池账号各一份，用账号自己的 ZCode 会话读；**赠券只认 ZCode 的登录身份，key 花不了**
+  ⇒ 要花它，就把 ZCode 切到那个账号（本工具管的就是这个），官方
+  `@magpie-community/opencode-zcode-auth` 随即用上它
 
 两个插件可以并存：官方的 `@magpie-community/opencode-zcode-auth` 是单账号登录
 （OAuth、团队席位、Start Plan 归它管），`zcode-pool` 是本机多账号池。
